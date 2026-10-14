@@ -1,8 +1,12 @@
 diff --git a/src/application/samples/products/sle_uart/sle_uart.c b/src/application/samples/products/sle_uart/sle_uart.c
-index 57e6ed6..781a635 100644
+index 57e6ed6..dc0f1b0 100644
 --- a/src/application/samples/products/sle_uart/sle_uart.c
 +++ b/src/application/samples/products/sle_uart/sle_uart.c
-@@ -15,6 +15,10 @@
+@@ -12,9 +12,14 @@
+ #include "uart.h"
+ #include "pm_clock.h"
+ #include "sle_low_latency.h"
++#include "tcxo.h"
  #if defined(CONFIG_SAMPLE_ENABLE_SLE_UART_SERVER)
  #include "securec.h"
  #include "sle_uart_server.h"
@@ -13,7 +17,7 @@ index 57e6ed6..781a635 100644
  #include "sle_uart_server_adv.h"
  #include "sle_device_discovery.h"
  #include "sle_errcode.h"
-@@ -54,10 +58,38 @@ static void ssaps_server_read_request_cbk(uint8_t server_id, uint16_t conn_id, s
+@@ -54,10 +59,45 @@ static void ssaps_server_read_request_cbk(uint8_t server_id, uint16_t conn_id, s
  static void ssaps_server_write_request_cbk(uint8_t server_id, uint16_t conn_id, ssaps_req_write_cb_t *write_cb_para,
      errcode_t status)
  {
@@ -29,7 +33,14 @@ index 57e6ed6..781a635 100644
 +    (void)status;
 +    static uint32_t s_rx_cnt = 0;
 +    static uint32_t s_hid_ok = 0;
++    static uint64_t s_last_rx_ms = 0;
 +    if ((write_cb_para->length >= 6) && write_cb_para->value) {
++        // 延迟测量标记：流量从静(>200ms无包)到动的瞬间立即打印（对齐 SNAP，无聚合量化）
++        uint64_t now_ms = uapi_tcxo_get_ms();
++        if (s_last_rx_ms != 0 && (now_ms - s_last_rx_ms) > 200) {
++            osal_printk("[BURST] gap=%lu ms\r\n", (unsigned long)(now_ms - s_last_rx_ms));
++        }
++        s_last_rx_ms = now_ms;
 +        const uint8_t *v = (const uint8_t *)write_cb_para->value;
 +        if (v[0] == 0xA5) {
 +            int16_t dx = (int16_t)((uint16_t)v[1] | ((uint16_t)v[2] << 8));
@@ -56,6 +67,28 @@ index 57e6ed6..781a635 100644
      }
  }
  
+diff --git a/src/application/samples/products/sle_uart/sle_uart_server/sle_uart_server.c b/src/application/samples/products/sle_uart/sle_uart_server/sle_uart_server.c
+index bdb1dcd..dc51e22 100644
+--- a/src/application/samples/products/sle_uart/sle_uart_server/sle_uart_server.c
++++ b/src/application/samples/products/sle_uart/sle_uart_server/sle_uart_server.c
+@@ -342,6 +342,17 @@ static void sle_connect_state_changed_cbk(uint16_t conn_id, const sle_addr_t *ad
+     if (conn_state == SLE_ACB_STATE_CONNECTED) {
+         g_conn_id = conn_id;
+         g_qos_link_info.link_state = SLE_QOS_IDLE;
++        // AirMouse：连接建立即压链路调度间隔（实测默认参数下 SLE 传输延迟 100~1700ms 随机抖动）。
++        // server 侧主动发起更新（sle_connection_manager.h:979）；单位 slot。
++        sle_connection_param_update_t upd = {0};
++        upd.conn_id = conn_id;
++        upd.interval_min = 8;   // slot
++        upd.interval_max = 16;  // slot
++        upd.max_latency = 0;
++        upd.supervision_timeout = 100; // 1s
++        errcode_t ur = sle_update_connect_param(&upd);
++        sample_at_log_print("%s update_connect_param: 0x%x (interval 8-16 slot)\r\n",
++            SLE_UART_SERVER_LOG, ur);
+     }
+     if (conn_state == SLE_ACB_STATE_DISCONNECTED) {
+         g_conn_id = 0;
 diff --git a/src/application/samples/products/usb_keyboard/keyboard_usb/keyscan_init.c b/src/application/samples/products/usb_keyboard/keyboard_usb/keyscan_init.c
 index 03bd177..08f66c7 100644
 --- a/src/application/samples/products/usb_keyboard/keyboard_usb/keyscan_init.c

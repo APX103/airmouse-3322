@@ -1274,7 +1274,7 @@ index 000000000..cdadb7e7d
 +    out->motionless = motionless_flag;
 +}
 diff --git a/samples/native_samples/sle/sle_client.c b/samples/native_samples/sle/sle_client.c
-index 2f6d27a2b..19ddab44a 100644
+index 2f6d27a2b..44c8e478e 100644
 --- a/samples/native_samples/sle/sle_client.c
 +++ b/samples/native_samples/sle/sle_client.c
 @@ -6,6 +6,13 @@
@@ -1291,7 +1291,7 @@ index 2f6d27a2b..19ddab44a 100644
  
  // 默认的中心设备MAC地址（用于配置本地地址）
  #define SLE_CONFIG_CONN_DEMO_CENTRAL_ADDR  \
-@@ -25,6 +32,391 @@ static uint8_t g_client_id = 0;
+@@ -25,6 +32,478 @@ static uint8_t g_client_id = 0;
  // 客户端设备ID（连接后分配）
  uint16_t g_client_device_id = 0;
  
@@ -1426,7 +1426,24 @@ index 2f6d27a2b..19ddab44a 100644
 +#define AIM_G                 9.80665
 +#define AIM_D2R               (3.14159265358979 / 180.0)
 +
-+// 一拍：读 IMU→EKF→输出 dx,dy（返回 false = 传感器读失败）
++// ================== 映射模式开关 ==================
++// 1 = 陀螺速率直出（exp/gyro-direct 分支）：gyro−零偏 → 轻滤波 → ×gain×dt，延迟 ~1ms。
++//     EKF 加计观测会把姿态往重力方向拉（快速转动时永远慢半拍），速率直出绕开整个姿态链。
++// 0 = EKF 姿态差分（stable 分支）：绝对姿态语义，供锚定/混合模式用。
++#define AIM_USE_GYRO_DIRECT 1
++
++#if AIM_USE_GYRO_DIRECT
++static double g_aim_gyro_bias_rad[3] = {0}; // 零偏估计（静止时 EMA 跟踪）
++static double g_aim_gyro_lpf[3] = {0};      // 轻滤波后的角速度（k=0.8, τ≈1ms @100Hz）
++static double g_aim_still_time = 0;         // 静止累计时长
++static bool g_aim_gyro_lpf_init = false;
++#define AIM_STILL_DPS      1.0    // 静止判据：总角速度低于此（°/s）
++#define AIM_STILL_HOLD_S   0.3    // 持续此时长才判静止（防抖动间隙误判）
++#define AIM_BIAS_EMA       0.02   // 静止时零偏 EMA 系数（缓慢跟踪温漂）
++#define AIM_GYRO_LPF_K     0.8    // 轻滤波系数（τ≈1.25ms @100Hz）
++#endif
++
++// 一拍：读 IMU→(EKF|直出)→输出 dx,dy（返回 false = 传感器读失败）
 +static bool aim_ekf_step(int16_t *dx_out, int16_t *dy_out)
 +{
 +    uint8_t raw[14] = {0};
@@ -1442,26 +1459,71 @@ index 2f6d27a2b..19ddab44a 100644
 +        acc[i] = (double)a / AIM_ACC_LSB_PER_G * AIM_G;          // → m/s²
 +        gyr[i] = (double)g / AIM_GYRO_LSB_DPS * AIM_D2R;         // → rad/s
 +    }
++    double dx = 0;
++    double dy = 0;
++#if AIM_USE_GYRO_DIRECT
++    // ---- 速率直出：零偏补偿 → 轻滤波 → 静止门 ----
++    if (!g_aim_gyro_lpf_init) {
++        for (int i = 0; i < 3; i++) {
++            g_aim_gyro_lpf[i] = gyr[i];
++        }
++        g_aim_gyro_lpf_init = true;
++    }
++    double corr[3];
++    for (int i = 0; i < 3; i++) {
++        double c = gyr[i] - g_aim_gyro_bias_rad[i];
++        g_aim_gyro_lpf[i] += AIM_GYRO_LPF_K * (c - g_aim_gyro_lpf[i]);
++        corr[i] = g_aim_gyro_lpf[i];
++    }
++    double norm_dps = sqrt(corr[0] * corr[0] + corr[1] * corr[1] + corr[2] * corr[2]) / AIM_D2R;
++    if (norm_dps < AIM_STILL_DPS) {
++        g_aim_still_time += 1.0 / AIM_EKF_FS;
++        if (g_aim_still_time >= AIM_STILL_HOLD_S) {
++            // 静止：EMA 缓慢跟踪零偏，输出归零
++            for (int i = 0; i < 3; i++) {
++                g_aim_gyro_bias_rad[i] += AIM_BIAS_EMA * (gyr[i] - g_aim_gyro_bias_rad[i]);
++            }
++            g_aim_moved_px += 0;
++            return true;
++        }
++    } else {
++        g_aim_still_time = 0;
++    }
++    // 延迟分段测量打点：甩动(>150°/s)瞬间打印——对照甩动动作看 [SNAP] 出现延迟=传感器+固件段
++    static uint32_t snap_armed = 1;
++    if (snap_armed && norm_dps > 150.0) {
++        printf("[SNAP] %d dps\n", (int)norm_dps);
++        snap_armed = 0; // 单发：静止门重新充能后再武装
++    }
++    if (norm_dps < 10.0) {
++        snap_armed = 1;
++    }
++    {
++        double dps_z = corr[2] / AIM_D2R; // 绕 Z（deg/s）
++        double dps_x = corr[0] / AIM_D2R; // 绕 X（deg/s）
++        double dt = 1.0 / AIM_EKF_FS;
++        dx = -dps_z * AIM_RATE_GAIN * dt; // 轴映射沿用实测定稿：绕Z→dx 反号
++        dy = dps_x * AIM_RATE_GAIN * dt;  // 绕X→dy 正号
++    }
++#else
 +    ekf7_output o;
 +    ekf7_pipeline_calculate(&g_aim_ekf, acc, gyr, NULL, &o);     // 六轴模式
 +    // 轴映射（2026-10-14 用户实测校正）：绕 Z 轴转(偏航) → dx，绕 X 轴转(横滚) → dy，两轴均反号。
-+    // （上一版误用绕 Y 轴(pitch)作 dy 且符号相反——安装姿态下板子"左右摆"= 绕Z，"翻腕"= 绕X）
 +    double dyaw = (o.euler_rad[2] - g_aim_rpy_last[2]) / AIM_D2R;   // 绕 Z，deg
 +    double droll = (o.euler_rad[0] - g_aim_rpy_last[0]) / AIM_D2R;  // 绕 X，deg
 +    for (int i = 0; i < 3; i++) {
 +        g_aim_rpy_last[i] = o.euler_rad[i];
 +    }
-+    if (o.motionless) {
-+        return true; // 静止冻结：不产生位移
-+    }
++    // 注意：不用 o.motionless 冻结输出（导航级判据的小幅迟滞问题，详见 motionless 注释）
 +    if (fabs(dyaw) < AIM_DEADBAND_DEG) {
 +        dyaw = 0;
 +    }
 +    if (fabs(droll) < AIM_DEADBAND_DEG) {
 +        droll = 0;
 +    }
-+    double dx = -dyaw * AIM_RATE_GAIN;   // 水平：绕 Z（2026-10-14 实测定稿）
-+    double dy = droll * AIM_RATE_GAIN;   // 翻腕：绕 X（实测再反号定稿）
++    dx = -dyaw * AIM_RATE_GAIN;
++    dy = droll * AIM_RATE_GAIN;
++#endif
 +    if (dx > 127) { dx = 127; }
 +    if (dx < -127) { dx = -127; }
 +    if (dy > 127) { dy = 127; }
@@ -1497,6 +1559,23 @@ index 2f6d27a2b..19ddab44a 100644
 +    pkt->keys = 0;
 +}
 +
++// 连接参数：实测默认参数下 SLE 传输延迟 100~1700ms 随机抖动（包等连接事件窗口）。
++// 正确姿势（SET_DEFAULT 全局默认会破坏 PAIR，已踩坑回退）：
++//   ① 栈启用后仅做 preset ADD（mode_id=1, 10~20ms 间隔）
++//   ② 连接建立后调 bs_sle_set_connect_param(dev_id, 1)（ssf_connection.h:860 运行时 API）
++static void aim_preset_conn_params(void)
++{
++    bs_sle_opr_pre_set_conn_param_t opr = {0};
++    opr.type = BS_SLE_PRESET_OPR_TYPE_ADD;
++    opr.in_add_param.mode_id = 1;
++    opr.in_add_param.para.interval_min = 8;             // 10ms（单位1.25ms）
++    opr.in_add_param.para.interval_max = 16;            // 20ms
++    opr.in_add_param.para.max_latency = 0;
++    opr.in_add_param.para.supervision_timeout = 100;    // 1s（单位10ms）
++    errcode_t r = bs_sle_config(SLE_CONFIG_CONNECT_PRESET_PARAM, &opr, sizeof(opr));
++    printf("[AIM][FSM] conn param preset ADD: 0x%x (10-20ms)\n", r);
++}
++
 +// ================= 自动连接状态机（产品形态：上电自动连 dongle，断线重连） =================
 +// 前向原型（定义在本文件后方）
 +errcode_t sle_demo_client_init(void);
@@ -1508,6 +1587,7 @@ index 2f6d27a2b..19ddab44a 100644
 +    static uint8_t st = 0;
 +    static uint32_t wait = 0;
 +    static bool stack_inited = false;
++    static bool g_aim_param_set_done = false;
 +    static bool ssap_inited = false;
 +    *need_delay = false;
 +
@@ -1515,6 +1595,7 @@ index 2f6d27a2b..19ddab44a 100644
 +        case 0: // 栈启用（一次）
 +            if (!stack_inited) {
 +                (void)at_sle_client_enable();
++                aim_preset_conn_params(); // 仅 ADD preset；连接后由 case4 调 set（SET_DEFAULT 会破坏 PAIR）
 +                stack_inited = true;
 +            }
 +            wait = 300; // 等 3s 栈起
@@ -1548,11 +1629,17 @@ index 2f6d27a2b..19ddab44a 100644
 +                st = 2; // 超时重试
 +            }
 +            break;
-+        case 4: // 已连接：缺句柄则 FIND
++        case 4: // 已连接：压连接间隔 → 缺句柄则 FIND
 +            if (!bt_sle_is_connected()) {
 +                g_aim_write_handle = 0; // 断线：清句柄回配对态
++                g_aim_param_set_done = false;
 +                st = 2;
 +                break;
++            }
++            if (!g_aim_param_set_done) { // 连接后一次性压间隔（治传输抖动）
++                errcode_t pr = bs_sle_set_connect_param(g_client_device_id, 1);
++                printf("[AIM][FSM] set_connect_param: 0x%x\n", pr);
++                g_aim_param_set_done = true;
 +            }
 +            if (g_aim_write_handle == 0) {
 +                (void)sle_ssapc_find_all_service(g_client_device_id, g_client_id, false);
@@ -1683,7 +1770,7 @@ index 2f6d27a2b..19ddab44a 100644
  // 客户端应用UUID（从服务发现结果中获取）
  static bs_sle_uuid_t g_client_app_uuid = {SLE_APP_UUID_LEN, {0}};
  
-@@ -53,17 +445,18 @@ static void sle_ssap_client_read_cbk(uint16_t dev_id, uint8_t client_id, bs_sle_
+@@ -53,17 +532,18 @@ static void sle_ssap_client_read_cbk(uint16_t dev_id, uint8_t client_id, bs_sle_
  }
  
  // SSAP客户端写操作回调函数
@@ -1710,7 +1797,7 @@ index 2f6d27a2b..19ddab44a 100644
      }
  }
  
-@@ -169,7 +562,10 @@ errcode_t sle_demo_client_init(void)
+@@ -169,7 +649,10 @@ errcode_t sle_demo_client_init(void)
      // step4: 打印注册成功的客户端ID
      printf("[SLE SSAPC] Registered: client_id=%d\n", g_client_id);
  
@@ -1722,7 +1809,7 @@ index 2f6d27a2b..19ddab44a 100644
      return ret;
  }
  
-@@ -390,6 +786,19 @@ static void sle_ssapc_find_service_cbk(uint16_t dev_id, uint8_t client_id, uint8
+@@ -390,6 +873,19 @@ static void sle_ssapc_find_service_cbk(uint16_t dev_id, uint8_t client_id, uint8
                          printf("%02X", service[s].property_list[i].uuid.uuid[j]);
                      }
                      printf("\n");
