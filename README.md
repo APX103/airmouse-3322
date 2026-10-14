@@ -6,6 +6,15 @@
 
 本仓库是**补丁集叠加层**：不含官方 SDK 全量，只含我们对官方库的修改（补丁）、自研资产（EKF/工具）和全部文档。官方库更新时在官方 checkout 上 `git pull` 后重放补丁即可跟随（改动的文件面很小，冲突概率低）。
 
+## 完整文档（note 库系列，四篇闭环）
+
+本仓库的完整原理、参数、代码片段与复现流程沉淀在笔记库（github.com/APX103/note，`embedded/` 目录）：
+
+1. [Hi3322 ↔ EB21duino 星闪链路验证](https://github.com/APX103/note/blob/main/embedded/hi3322-sle-dongle-link-verification.html) —— 技术路线调研与源码级实锤
+2. [3322 空鼠垂直切片实录](https://github.com/APX103/note/blob/main/embedded/hi3322-airmouse-vertical-slice.html) —— M0-M3：链路/挂死结案/IMU/EKF
+3. [3322 空鼠调通实录与完全指南](https://github.com/APX103/note/blob/main/embedded/hi3322-airmouse-complete-guide.html) —— M4 端到端 + 环境/烧录/接线全套
+4. [3322 空鼠手感终版](https://github.com/APX103/note/blob/main/embedded/hi3322-airmouse-feel-good-final.html) —— 陀螺直出架构 + 延迟追凶全案 + **13 段完整代码附录（可凭文复现本项目）**
+
 ## 仓库结构
 
 ```
