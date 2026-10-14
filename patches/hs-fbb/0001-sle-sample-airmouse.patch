@@ -1274,7 +1274,7 @@ index 000000000..cdadb7e7d
 +    out->motionless = motionless_flag;
 +}
 diff --git a/samples/native_samples/sle/sle_client.c b/samples/native_samples/sle/sle_client.c
-index 2f6d27a2b..74cc62827 100644
+index 2f6d27a2b..48581fc7d 100644
 --- a/samples/native_samples/sle/sle_client.c
 +++ b/samples/native_samples/sle/sle_client.c
 @@ -6,6 +6,13 @@
@@ -1418,7 +1418,7 @@ index 2f6d27a2b..74cc62827 100644
 +static double g_aim_rpy_last[3] = {0};
 +static uint32_t g_aim_moved_px = 0;
 +#define AIM_EKF_FS        100.0                    // 采样率 Hz（与任务节拍一致）
-+#define AIM_RATE_GAIN     200.0                    // px/deg（用户指定 200）
++#define AIM_RATE_GAIN     50.0                     // px/deg（用户指定 50）
 +#define AIM_DEADBAND_DEG  0.03                     // 单拍姿态增量死区
 +
 +#define AIM_ACC_LSB_PER_G 16384.0                  // ±2g（配置寄存器未生效的默认量程，重力实测校准）

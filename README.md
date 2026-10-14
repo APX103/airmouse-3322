@@ -79,7 +79,7 @@ cd ~/.hs-fbb/tools/hs-flash/26.09.1
 
 | 旋钮 | 宏/位置 | 当前值 |
 |---|---|---|
-| 灵敏度 | `AIM_RATE_GAIN` | 200 px/deg |
+| 灵敏度 | `AIM_RATE_GAIN` | 50 px/deg |
 | 死区 | `AIM_DEADBAND_DEG` | 0.03° |
 | 轴方向 | aim_ekf_step 尾部两行符号 | dx=-Δyaw(绕Z), dy=+Δroll(绕X) |
 | 跟手度（滤波） | ekf7/ekf7_filter.c:18-19 | gyro 0.5 / acc 0.3 |
