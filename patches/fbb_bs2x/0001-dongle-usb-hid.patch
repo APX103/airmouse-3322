@@ -1,5 +1,5 @@
 diff --git a/src/application/samples/products/sle_uart/sle_uart.c b/src/application/samples/products/sle_uart/sle_uart.c
-index 57e6ed6..dc0f1b0 100644
+index 57e6ed6..6df851b 100644
 --- a/src/application/samples/products/sle_uart/sle_uart.c
 +++ b/src/application/samples/products/sle_uart/sle_uart.c
 @@ -12,9 +12,14 @@
@@ -26,7 +26,7 @@ index 57e6ed6..dc0f1b0 100644
 -    if ((write_cb_para->length > 0) && write_cb_para->value) {
 -        uapi_uart_write(CONFIG_SLE_UART_BUS, (uint8_t *)write_cb_para->value, write_cb_para->length, 0);
 +    // AirMouse M4：解析 3322 的鼠标包（0xA5 + int16 dx + int16 dy + keys）→ USB HID report。
-+    // 借 usb_keyboard 样例的复合描述符（report_id=0x02 段即 boot mouse：3 buttons + X/Y/wheel），
++    // 复用 usb_keyboard 样例的复合描述符（report_id=0x02 段即 boot mouse：3 buttons + X/Y/wheel），
 +    // 索引共享 keyscan_init.c 的 g_usb_keyscan_hid_index（已去 static）。低频聚合统计打印保留。
 +    (void)server_id;
 +    (void)conn_id;
