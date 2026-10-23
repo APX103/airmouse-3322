@@ -1274,10 +1274,10 @@ index 000000000..cdadb7e7d
 +    out->motionless = motionless_flag;
 +}
 diff --git a/samples/native_samples/sle/sle_client.c b/samples/native_samples/sle/sle_client.c
-index 2f6d27a2b..44c8e478e 100644
+index 2f6d27a2b..a8583aad2 100644
 --- a/samples/native_samples/sle/sle_client.c
 +++ b/samples/native_samples/sle/sle_client.c
-@@ -6,6 +6,13 @@
+@@ -6,6 +6,15 @@
   */
  #include "sle_client.h"
  #include "securec.h"
@@ -1285,13 +1285,15 @@ index 2f6d27a2b..44c8e478e 100644
 +#include "sle_com.h"
 +#include "pm_veto.h"
 +#include "i2c.h"
++#include "gpio.h"
++#include "pinctrl.h"
 +#include "ekf7.h"
 +#include <math.h>
 +#include "app_init.h"
  
  // 默认的中心设备MAC地址（用于配置本地地址）
  #define SLE_CONFIG_CONN_DEMO_CENTRAL_ADDR  \
-@@ -25,6 +32,478 @@ static uint8_t g_client_id = 0;
+@@ -25,6 +34,519 @@ static uint8_t g_client_id = 0;
  // 客户端设备ID（连接后分配）
  uint16_t g_client_device_id = 0;
  
@@ -1318,6 +1320,39 @@ index 2f6d27a2b..44c8e478e 100644
 +static volatile uint32_t g_aim_cfm_cnt = 0; // （历史）累计确认数
 +static uint32_t g_aim_fail_streak = 0;      // 连续写失败计数（无确认写背压）
 +static uint32_t g_aim_backoff = 0;          // 退避剩余拍数
++
++// ================= 鼠标左右键（feat/buttons） =================
++// J1902-4 = S_MGPIO15(左键)、J1902-7 = S_AGPIO12(右键)；按钮另一端接 GND，内部上拉（零外阻）。
++// 按下=接地=读 0。keys 位语义：bit0=左键 bit1=右键（bit2=Q bit3=E 预留）。
++// pin_t 枚举名出自 drivers/boards/3322_evb/product/product_pin.h（编译实证链）；
++// 若枚举不可见则退回数值 47/87。
++#define AIM_BTN_L_PIN S_MGPIO15
++#define AIM_BTN_R_PIN S_AGPIO12
++
++static void aim_btn_init(void)
++{
++    uapi_pin_set_mode(AIM_BTN_L_PIN, PIN_MODE_0);
++    uapi_pin_set_mode(AIM_BTN_R_PIN, PIN_MODE_0);
++    uapi_pin_set_pull(AIM_BTN_L_PIN, PIN_PULL_UP);
++    uapi_pin_set_pull(AIM_BTN_R_PIN, PIN_PULL_UP);
++    uapi_gpio_set_dir(AIM_BTN_L_PIN, GPIO_DIRECTION_INPUT);
++    uapi_gpio_set_dir(AIM_BTN_R_PIN, GPIO_DIRECTION_INPUT);
++}
++
++// 2 拍一致消抖（100Hz 下 20ms 窗）；返回 keys 位图
++static uint8_t aim_btn_scan(void)
++{
++    static uint8_t prev_raw = 0xFF;
++    static uint8_t stable = 0;
++    uint8_t raw = 0;
++    if (uapi_gpio_get_val(AIM_BTN_L_PIN) == GPIO_LEVEL_LOW) { raw |= 0x01; }
++    if (uapi_gpio_get_val(AIM_BTN_R_PIN) == GPIO_LEVEL_LOW) { raw |= 0x02; }
++    if (raw == prev_raw) {
++        stable = raw;
++    }
++    prev_raw = raw;
++    return stable;
++}
 +
 +// ================= ICM20948 最小驱动（M1/M2 验证版） =================
 +// J1901-11/12 = I2C0_SCL/SDA(MGPIO_4/5)，电平 SW1901-5 默认 OFF=3.3V；地址 0x68（AD0 悬空）。
@@ -1672,6 +1707,7 @@ index 2f6d27a2b..44c8e478e 100644
 +    errcode_t imu_ret = aim_imu_init();
 +    printf("[AIM] imu init: 0x%x\n", imu_ret);
 +    aim_imu_config(); // 软复位+唤醒+量程/ODR
++    aim_btn_init();   // 左右键 GPIO（内部上拉，零外阻）
 +    aim_imu_report(); // 开机即读一次
 +    ekf7_pipeline_init(&g_aim_ekf, AIM_EKF_FS, 1, 0); // work_mode=1（验证态一致），六轴
 +    g_aim_ekf_init = true;
@@ -1713,14 +1749,21 @@ index 2f6d27a2b..44c8e478e 100644
 +            skipped++;
 +            continue;
 +        }
-+        // 发送：直接用本拍 EKF 输出（零位移不发）
++        // 发送：直接用本拍 EKF 输出 + 按键状态（零位移且按键无变化且无按住时不发）
 +        aim_mouse_pkt_t pkt;
 +        pkt.magic = 0xA5;
-+        pkt.keys = 0;
++        pkt.keys = aim_btn_scan();
 +        pkt.dx = dx_now;
 +        pkt.dy = dy_now;
-+        if (pkt.dx == 0 && pkt.dy == 0) {
-+            continue;
++        static uint8_t s_prev_keys_sent = 0;
++        bool keys_changed = (pkt.keys != s_prev_keys_sent);
++        bool any_held = (pkt.keys != 0);
++        if (pkt.dx == 0 && pkt.dy == 0 && !keys_changed && !any_held) {
++            continue; // 全静止：不发包
++        }
++        if (keys_changed) {
++            s_prev_keys_sent = pkt.keys;
++            printf("[AIM][BTN] keys=0x%x\n", pkt.keys); // 按键沿：串口可见（调试期）
 +        }
 +        if (sle_ssapc_write_buf(g_client_device_id, g_client_id, g_aim_write_handle,
 +            (const uint8_t *)&pkt, sizeof(pkt)) == ERRCODE_BT_SUCCESS) {
@@ -1770,7 +1813,7 @@ index 2f6d27a2b..44c8e478e 100644
  // 客户端应用UUID（从服务发现结果中获取）
  static bs_sle_uuid_t g_client_app_uuid = {SLE_APP_UUID_LEN, {0}};
  
-@@ -53,17 +532,18 @@ static void sle_ssap_client_read_cbk(uint16_t dev_id, uint8_t client_id, bs_sle_
+@@ -53,17 +575,18 @@ static void sle_ssap_client_read_cbk(uint16_t dev_id, uint8_t client_id, bs_sle_
  }
  
  // SSAP客户端写操作回调函数
@@ -1797,7 +1840,7 @@ index 2f6d27a2b..44c8e478e 100644
      }
  }
  
-@@ -169,7 +649,10 @@ errcode_t sle_demo_client_init(void)
+@@ -169,7 +692,10 @@ errcode_t sle_demo_client_init(void)
      // step4: 打印注册成功的客户端ID
      printf("[SLE SSAPC] Registered: client_id=%d\n", g_client_id);
  
@@ -1809,7 +1852,7 @@ index 2f6d27a2b..44c8e478e 100644
      return ret;
  }
  
-@@ -390,6 +873,19 @@ static void sle_ssapc_find_service_cbk(uint16_t dev_id, uint8_t client_id, uint8
+@@ -390,6 +916,19 @@ static void sle_ssapc_find_service_cbk(uint16_t dev_id, uint8_t client_id, uint8
                          printf("%02X", service[s].property_list[i].uuid.uuid[j]);
                      }
                      printf("\n");
