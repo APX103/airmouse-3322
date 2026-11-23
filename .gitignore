@@ -1,0 +1,14 @@
+# 目录内自包含的开发环境（source env.sh 启用）——全部可删可重建，不进仓库
+# 注意：gitignore 不支持行尾注释，下面的规则行后面不要跟 "# ..."，否则规则失效。
+#
+# .fbb/        FBB_INSTALL_DIR：fbb 托管的 venv + 工具链（bisheng / hs-flash / ccache / uv 缓存）
+# sdk/         官方 SDK checkout：hs-fbb（3322 端）+ fbb_bs2x（dongle 端），含已打补丁的源码和编译产物
+# downloads/   大体积下载物（如 dongle 编译镜像的 fbb_ws63_wsl.tar）
+.fbb/
+sdk/
+downloads/
+
+# agent / 编辑器插件的本地状态
+.v2c/
+.video_agent/
+.DS_Store
