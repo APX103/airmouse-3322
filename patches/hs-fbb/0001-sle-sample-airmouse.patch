@@ -1274,10 +1274,10 @@ index 000000000..cdadb7e7d
 +    out->motionless = motionless_flag;
 +}
 diff --git a/samples/native_samples/sle/sle_client.c b/samples/native_samples/sle/sle_client.c
-index 2f6d27a2b..a8583aad2 100644
+index 2f6d27a2b..e93499c56 100644
 --- a/samples/native_samples/sle/sle_client.c
 +++ b/samples/native_samples/sle/sle_client.c
-@@ -6,6 +6,15 @@
+@@ -6,6 +6,16 @@
   */
  #include "sle_client.h"
  #include "securec.h"
@@ -1285,6 +1285,7 @@ index 2f6d27a2b..a8583aad2 100644
 +#include "sle_com.h"
 +#include "pm_veto.h"
 +#include "i2c.h"
++#include "tcxo.h"
 +#include "gpio.h"
 +#include "pinctrl.h"
 +#include "ekf7.h"
@@ -1293,7 +1294,7 @@ index 2f6d27a2b..a8583aad2 100644
  
  // 默认的中心设备MAC地址（用于配置本地地址）
  #define SLE_CONFIG_CONN_DEMO_CENTRAL_ADDR  \
-@@ -25,6 +34,519 @@ static uint8_t g_client_id = 0;
+@@ -25,6 +35,1069 @@ static uint8_t g_client_id = 0;
  // 客户端设备ID（连接后分配）
  uint16_t g_client_device_id = 0;
  
@@ -1321,32 +1322,96 @@ index 2f6d27a2b..a8583aad2 100644
 +static uint32_t g_aim_fail_streak = 0;      // 连续写失败计数（无确认写背压）
 +static uint32_t g_aim_backoff = 0;          // 退避剩余拍数
 +
++// ================= 开关量输入：按"空脚电平"判闭合（按键与编码器共用） =================
++// 规则：开机时各脚稳定读到的电平记为"空脚"（没按下/没闭合），之后只有电平与它相反才算"闭合"。
++// 为什么不写死"读低=闭合"：J1902 信号经电平转换器才到芯片，芯片内部上下拉压不过它（2026-11-24 上板实测：
++// 寄存器里上拉已置位，但这几个脚设上拉/下拉/都不设，读数完全不变）——左键和编码器脚空着读 0，右键脚空着读 1。
++// 写死低电平有效的话，空板就成了左键一直按着、零位移也持续发包。
++// 按空脚电平判之后：没接东西 -> 永不触发；排针侧有上拉的（空脚读 1）-> 闭合到 GND；
++// 空脚读 0 的 -> 闭合到 3.3V（J1902 第17脚，丝印 3.3V；不需要外部电阻）。
++// 注意：开机采样的一小段时间内不要按按键、不要转旋钮，否则那一脚会判反（重新上电即恢复）。
++#define AIM_INPUT_IDLE_MS   120  // 开机采样开路电平的时长
++#define AIM_INPUT_SAMPLE_MS 3
++
++static uint8_t aim_pin_level(pin_t pin)
++{
++    return (uapi_gpio_get_val(pin) == GPIO_LEVEL_HIGH) ? 1 : 0;
++}
++
++static void aim_input_config(pin_t pin)
++{
++    uapi_pin_set_mode(pin, PIN_MODE_0);
++    uapi_pin_set_pull(pin, PIN_PULL_UP);
++    uapi_gpio_set_dir(pin, GPIO_DIRECTION_INPUT);
++}
++
++// 采样期间读高占多数 -> 开路电平为 1
++static uint8_t aim_input_open_level(uint32_t highs, uint32_t samples)
++{
++    return (highs * 2 >= samples) ? 1 : 0;
++}
++
++// 开机诊断（只打印一次）：每个输入脚在"无上下拉 / 下拉 / 上拉"三种设置下各采 AIM_INPUT_DIAG_N 次，
++// 打印其中读到高的次数。用来判断空脚电平是谁定的——芯片内部上下拉，还是板上电平转换器的偏置：
++// 三种设置的读数一样 -> 芯片内部上下拉对这个脚不起作用，空脚电平由板子决定（接线时按它选 3.3V 或 GND）。
++#define AIM_INPUT_DIAG   1
++#define AIM_INPUT_DIAG_N 20
++static void aim_input_diag(pin_t pin, const char *name)
++{
++    static const pin_pull_t pulls[3] = { PIN_PULL_NONE, PIN_PULL_DOWN, PIN_PULL_UP };
++    uint32_t highs[3] = { 0, 0, 0 };
++    uapi_pin_set_mode(pin, PIN_MODE_0);
++    (void)uapi_gpio_set_dir(pin, GPIO_DIRECTION_INPUT);
++    for (uint32_t i = 0; i < 3; i++) {
++        (void)uapi_pin_set_pull(pin, pulls[i]);
++        osal_msleep(20); // 等电平稳定
++        for (uint32_t n = 0; n < AIM_INPUT_DIAG_N; n++) {
++            highs[i] += aim_pin_level(pin);
++            osal_msleep(1);
++        }
++    }
++    printf("[AIM][IO] %-26s none=%u/%u down=%u/%u up=%u/%u (读到高的次数)\n", name,
++        highs[0], AIM_INPUT_DIAG_N, highs[1], AIM_INPUT_DIAG_N, highs[2], AIM_INPUT_DIAG_N);
++}
++
 +// ================= 鼠标左右键（feat/buttons） =================
-+// J1902-4 = S_MGPIO15(左键)、J1902-7 = S_AGPIO12(右键)；按钮另一端接 GND，内部上拉（零外阻）。
-+// 按下=接地=读 0。keys 位语义：bit0=左键 bit1=右键（bit2=Q bit3=E 预留）。
++// J1902 第4脚(丝印 CS) = S_MGPIO15(左键)、第7脚(丝印 RX4) = S_AGPIO12(右键)。按钮一脚接排针，另一脚接哪要按各脚的空脚电平选
++// （2026-11-24 实测：左键脚空脚读 0、右键脚空脚读 1）：闭合 = 电平与空脚相反，
++// 所以 左键另一脚接 3.3V(PIN17)，右键另一脚接 GND(PIN5/6)；反过来接闭合前后电平不变，等于没接。
++// keys 位语义：bit0=左键 bit1=右键（bit2=Q bit3=E 预留）。
 +// pin_t 枚举名出自 drivers/boards/3322_evb/product/product_pin.h（编译实证链）；
 +// 若枚举不可见则退回数值 47/87。
 +#define AIM_BTN_L_PIN S_MGPIO15
 +#define AIM_BTN_R_PIN S_AGPIO12
 +
++static uint8_t g_aim_btn_open[2] = {0, 0}; // 左/右键脚的开路电平
++
 +static void aim_btn_init(void)
 +{
-+    uapi_pin_set_mode(AIM_BTN_L_PIN, PIN_MODE_0);
-+    uapi_pin_set_mode(AIM_BTN_R_PIN, PIN_MODE_0);
-+    uapi_pin_set_pull(AIM_BTN_L_PIN, PIN_PULL_UP);
-+    uapi_pin_set_pull(AIM_BTN_R_PIN, PIN_PULL_UP);
-+    uapi_gpio_set_dir(AIM_BTN_L_PIN, GPIO_DIRECTION_INPUT);
-+    uapi_gpio_set_dir(AIM_BTN_R_PIN, GPIO_DIRECTION_INPUT);
++    aim_input_config(AIM_BTN_L_PIN);
++    aim_input_config(AIM_BTN_R_PIN);
++    osal_msleep(5); // 等配置稳定
++    uint32_t high_l = 0;
++    uint32_t high_r = 0;
++    uint32_t samples = 0;
++    for (uint32_t t = 0; t < AIM_INPUT_IDLE_MS; t += AIM_INPUT_SAMPLE_MS) {
++        high_l += aim_pin_level(AIM_BTN_L_PIN);
++        high_r += aim_pin_level(AIM_BTN_R_PIN);
++        samples++;
++        osal_msleep(AIM_INPUT_SAMPLE_MS);
++    }
++    g_aim_btn_open[0] = aim_input_open_level(high_l, samples);
++    g_aim_btn_open[1] = aim_input_open_level(high_r, samples);
 +}
 +
-+// 2 拍一致消抖（100Hz 下 20ms 窗）；返回 keys 位图
++// 2 拍一致消抖（100Hz 下 20ms 窗）；返回 keys 位图。电平与开路电平相反 = 按下
 +static uint8_t aim_btn_scan(void)
 +{
 +    static uint8_t prev_raw = 0xFF;
 +    static uint8_t stable = 0;
 +    uint8_t raw = 0;
-+    if (uapi_gpio_get_val(AIM_BTN_L_PIN) == GPIO_LEVEL_LOW) { raw |= 0x01; }
-+    if (uapi_gpio_get_val(AIM_BTN_R_PIN) == GPIO_LEVEL_LOW) { raw |= 0x02; }
++    if (aim_pin_level(AIM_BTN_L_PIN) != g_aim_btn_open[0]) { raw |= 0x01; }
++    if (aim_pin_level(AIM_BTN_R_PIN) != g_aim_btn_open[1]) { raw |= 0x02; }
 +    if (raw == prev_raw) {
 +        stable = raw;
 +    }
@@ -1354,8 +1419,272 @@ index 2f6d27a2b..a8583aad2 100644
 +    return stable;
 +}
 +
++// ================= 旋转编码器：灵敏度旋钮（feat/encoder，Waveshare Rotation Sensor，20 脉冲/圈带按键） =================
++// 接线（J1902，丝印以板为准）：SIA→PIN1(DO)=S_MGPIO13，SIB→PIN2(DI)=S_MGPIO12，SW→PIN3(CLK)=S_MGPIO14；
++// 模块 VCC→PIN17(3.3V)，GND→PIN5。拨码全 OFF（J1902 为 3.3V 域）。
++// 排针到芯片之间是 ET5014 自动辨向电平转换器（U1801）。2026-11-24 上板实测：这三个脚空着时读 0，
++// 而且"无上下拉 / 内部下拉 / 内部上拉"三种设置读数完全一样——芯片内部上下拉压不过它，空脚电平由板子决定。
++// 所以闭合/断开按开机时的空脚电平判定（见上方"开关量输入"）：触点公共端接 GND 时排针侧必须有外部上拉，
++// 否则触点闭合也是 0、分辨不出来；触点公共端改接 3.3V 则不需要外部电阻。三根线都只做输入，接错脚不会损坏板子。
++// 采样方式：A/B/SW 三根线注册双边沿 GPIO 中断，有边沿才唤醒任务读引脚（空闲时零唤醒）。
++// 不要改回周期轮询：2026-11-24 上板实测，1kHz 周期任务在"已连接且空闲"状态下会把 aim_demo 任务拖到约 1/4 速度
++// （统计行 4 秒一行、按键响应变慢）；未连接或持续发包时没有这个现象。100Hz 的 aim_demo 本身不受影响。
++#define AIM_ENC_A_PIN    S_MGPIO13
++#define AIM_ENC_B_PIN    S_MGPIO12
++#define AIM_ENC_SW_PIN   S_MGPIO14
++#define AIM_ENC_STACK    0x2000
++#define AIM_ENC_PRIO     20    // 数值小=优先级高；高于 aim_demo(28)，边沿来了立刻读引脚
++#define AIM_ENC_IRQ      1     // 1=双边沿中断驱动；0=100Hz 轮询（兜底，快速转动会丢格）
++#define AIM_ENC_TRIG_BOTH_EDGES 0x3U // hal_gpio.h 的 GPIO_INTERRUPT_DEDGE = 上升沿(0x1) | 下降沿(0x2)
++#define AIM_ENC_POLL_MS  10    // AIM_ENC_IRQ=0 时的轮询周期
++#define AIM_ENC_REST_MS  100   // 停在定位点（A、B 都断开）超过此时长，清掉漏采留下的半格计数
++#define AIM_ENC_STEPS_PER_DETENT 4  // 一格 = A/B 走完一个周期（4 次合法跳变）；若实测"两格才变一次"改成 2
++#define AIM_ENC_SW_DEBOUNCE_MS 20   // 按键消抖窗（ms）
++#define AIM_ENC_DIR_SIGN (+1)  // B 超前 A 记作"加"；实测顺时针反而减小时改成 (-1)
++#define AIM_ENC_GAIN_STEP 2    // 旋一格 ±2 px/deg
++#define AIM_GAIN_MIN      10   // px/deg
++#define AIM_GAIN_MAX      150
++#define AIM_GAIN_DEFAULT  42   // px/deg。旧版循环 11.8ms 一拍却按 10ms 积分，标称 50 的实际手感约等于现在的 42
++
++// 运行时灵敏度（px/deg，整数）：编码器任务写、aim_demo 任务读；32 位整数读写原子，无需加锁
++static volatile int g_aim_gain = AIM_GAIN_DEFAULT;
++static volatile uint8_t g_aim_enc_raw = 0; // 调试用：bit2=A bit1=B bit0=SW 的原始电平（1=高）
++static volatile uint8_t g_aim_enc_open_mask = 0; // 同三位：各脚的空脚电平（编码器任务开机采样）
++static volatile uint32_t g_aim_enc_irq_cnt = 0; // 收到的边沿中断个数（调试用）
++static osal_task *g_aim_enc_task = NULL;
++
++// 相状态 = (A<<1)|B，"1"=触点闭合（引脚读低）。B 超前 A 的方向为 00→01→11→10→00（每步 +1），反向 −1。
++// 查表下标 (prev<<2)|curr：同态 0；单步合法跳变 ±1；双位同变（漏采/毛刺）为 0，由调用方只对齐不计步。
++static const int8_t g_aim_enc_tab[16] = {
++     0,  1, -1,  0,   // prev 00
++    -1,  0,  0,  1,   // prev 01
++     1,  0,  0, -1,   // prev 10
++     0, -1,  1,  0,   // prev 11
++};
++
++static uint8_t aim_enc_read(void)
++{
++    uint8_t raw = 0;
++    if (uapi_gpio_get_val(AIM_ENC_A_PIN) != GPIO_LEVEL_LOW) { raw |= 0x04; }
++    if (uapi_gpio_get_val(AIM_ENC_B_PIN) != GPIO_LEVEL_LOW) { raw |= 0x02; }
++    if (uapi_gpio_get_val(AIM_ENC_SW_PIN) != GPIO_LEVEL_LOW) { raw |= 0x01; }
++    g_aim_enc_raw = raw;
++    return raw;
++}
++
++// 相状态 = (A闭合<<1)|B闭合，"闭合"= 电平与该脚的开路电平相反
++static uint8_t aim_enc_state(uint8_t raw)
++{
++    return (uint8_t)(((raw ^ g_aim_enc_open_mask) & 0x06) >> 1);
++}
++
++// 一格事件：up=1 增益加一格，up=-1 减一格；夹在 [AIM_GAIN_MIN, AIM_GAIN_MAX]
++static void aim_enc_detent(int up)
++{
++    int gain = g_aim_gain + up * AIM_ENC_DIR_SIGN * AIM_ENC_GAIN_STEP;
++    if (gain < AIM_GAIN_MIN) {
++        gain = AIM_GAIN_MIN;
++    }
++    if (gain > AIM_GAIN_MAX) {
++        gain = AIM_GAIN_MAX;
++    }
++    if (gain == g_aim_gain) {
++        return; // 已在端点
++    }
++    g_aim_gain = gain;
++    printf("[AIM][ENC] %s gain=%d px/deg\n", up > 0 ? "up" : "down", gain);
++}
++
++// 解码器状态（仅 aim_enc_feed 访问，即只在编码器任务里跑）
++static uint8_t g_aim_enc_stable;   // 当前认可的相状态
++static int g_aim_enc_acc;          // 步数累加，满 ±STEPS_PER_DETENT 触发一格
++static uint16_t g_aim_enc_rest_ms; // 在定位点停留的时长（ms）
++static uint8_t g_aim_enc_sw_last;  // 已确认的按键状态（1=按下）
++static uint8_t g_aim_enc_sw_cand;  // 候选电平已在计时（上一拍与这一拍都是这个"不同"的电平）
++static uint16_t g_aim_enc_sw_ms;   // 候选电平被观察到的时长（ms）
++static uint32_t g_aim_enc_last_ms; // 上一次喂解码器的时刻（ms）
++static uint32_t g_aim_enc_timeout_ms = 0; // 任务下一次醒来的超时（ms，0=没有待办，只等边沿）
++
++// 喂一次原始电平。dt_ms = 距上一次喂的时间：轮询时就是轮询周期；中断驱动时是"距上个边沿/超时"的实际间隔，
++// 中间没有采样，所以时长只从"连续两次看到同一候选电平"开始累计。副作用只有 aim_enc_detent 与 SW 复位。
++// 静态零值恰好是"停在定位点、按键松开"的空闲态，上电无需专门初始化。
++static void aim_enc_feed(uint8_t raw, uint32_t dt_ms)
++{
++    // ---- SW：与已确认状态不同的电平要持续 DEBOUNCE_MS 才算稳定（闭合 = 与空脚电平相反） ----
++    uint8_t sw = (uint8_t)((raw ^ g_aim_enc_open_mask) & 0x01);
++    if (sw == g_aim_enc_sw_last) {
++        g_aim_enc_sw_cand = 0;
++        g_aim_enc_sw_ms = 0;
++    } else {
++        if (g_aim_enc_sw_cand && (g_aim_enc_sw_ms < AIM_ENC_SW_DEBOUNCE_MS)) {
++            g_aim_enc_sw_ms = (dt_ms >= AIM_ENC_SW_DEBOUNCE_MS) ? AIM_ENC_SW_DEBOUNCE_MS
++                                                                : (uint16_t)(g_aim_enc_sw_ms + dt_ms);
++        }
++        g_aim_enc_sw_cand = 1;
++        if (g_aim_enc_sw_ms >= AIM_ENC_SW_DEBOUNCE_MS) {
++            g_aim_enc_sw_last = sw;
++            g_aim_enc_sw_cand = 0;
++            g_aim_enc_sw_ms = 0;
++            if (sw) {
++                g_aim_gain = AIM_GAIN_DEFAULT;
++                printf("[AIM][ENC] sw press: gain reset %d\n", AIM_GAIN_DEFAULT);
++            }
++        }
++    }
++
++    // ---- A/B：每次采样直接查表，不做"连续 N 次才认"的滤波 ----
++    // 采样式解码只要不漏相位就必然正确：每步 ±1 沿真实路径累加，触点抖动一去一回自动抵消，
++    // 单次毛刺也是成对出现。加了滤波反而会在手快时滤掉短相位，导致丢格（Mac 上仿真实测）。
++    // 中断驱动下每次跳变都会采样，漏相位只会来自"任务还没读引脚就又跳了一次"。
++    uint8_t cur = aim_enc_state(raw);
++    uint8_t changed = (uint8_t)(cur != g_aim_enc_stable);
++    if (changed) {
++        g_aim_enc_acc += g_aim_enc_tab[(g_aim_enc_stable << 2) | cur]; // 0 = 双位同变（漏相位）：只对齐不计步
++        if (g_aim_enc_acc >= AIM_ENC_STEPS_PER_DETENT) {
++            g_aim_enc_acc -= AIM_ENC_STEPS_PER_DETENT;
++            aim_enc_detent(1);
++        } else if (g_aim_enc_acc <= -AIM_ENC_STEPS_PER_DETENT) {
++            g_aim_enc_acc += AIM_ENC_STEPS_PER_DETENT;
++            aim_enc_detent(-1);
++        }
++        g_aim_enc_stable = cur;
++    }
++
++    // ---- 停在定位点（A、B 都断开）够久：清掉漏采留下的半格计数 ----
++    if (g_aim_enc_stable != 0) {
++        g_aim_enc_rest_ms = 0;
++    } else if (!changed) {
++        if (g_aim_enc_rest_ms < AIM_ENC_REST_MS) {
++            g_aim_enc_rest_ms = (dt_ms >= AIM_ENC_REST_MS) ? AIM_ENC_REST_MS : (uint16_t)(g_aim_enc_rest_ms + dt_ms);
++            if (g_aim_enc_rest_ms >= AIM_ENC_REST_MS) {
++                g_aim_enc_acc = 0;
++            }
++        }
++    } else {
++        g_aim_enc_rest_ms = 0; // 刚到定位点，从这一拍起计时
++    }
++}
++
++// 距下一个"到点要再看一眼"的时刻还有多少 ms：按键候选电平的消抖窗、定位点停留的清零窗；都没有就返回 0
++static uint32_t aim_enc_next_timeout_ms(void)
++{
++    uint32_t timeout = 0;
++    if (g_aim_enc_sw_cand && (g_aim_enc_sw_ms < AIM_ENC_SW_DEBOUNCE_MS)) {
++        timeout = AIM_ENC_SW_DEBOUNCE_MS - g_aim_enc_sw_ms;
++    }
++    if ((g_aim_enc_stable == 0) && (g_aim_enc_acc != 0) && (g_aim_enc_rest_ms < AIM_ENC_REST_MS)) {
++        uint32_t rest = AIM_ENC_REST_MS - g_aim_enc_rest_ms;
++        if ((timeout == 0) || (rest < timeout)) {
++            timeout = rest;
++        }
++    }
++    return timeout;
++}
++
++// 任务醒来后的全部工作：读引脚 -> 按实际间隔喂解码器 -> 算出下一次超时。now_ms 用单调毫秒数（系统节拍）。
++static uint32_t aim_enc_service(uint32_t now_ms)
++{
++    aim_enc_feed(aim_enc_read(), now_ms - g_aim_enc_last_ms);
++    g_aim_enc_last_ms = now_ms;
++    return aim_enc_next_timeout_ms();
++}
++
++// GPIO 中断回调（中断上下文）：只记数、只唤醒任务；读引脚、解码、打印都在任务里做
++static osal_semaphore g_aim_enc_sem;
++
++static void aim_enc_isr(pin_t pin, uintptr_t param)
++{
++    (void)pin;
++    (void)param;
++    g_aim_enc_irq_cnt++;
++    osal_sem_up(&g_aim_enc_sem);
++}
++
++static int aim_enc_task(void *arg)
++{
++    (void)arg;
++#if AIM_INPUT_DIAG
++    aim_input_diag(AIM_ENC_A_PIN, "SIA S_MGPIO13 J1902-1");
++    aim_input_diag(AIM_ENC_B_PIN, "SIB S_MGPIO12 J1902-2");
++    aim_input_diag(AIM_ENC_SW_PIN, "SW  S_MGPIO14 J1902-3");
++    aim_input_diag(AIM_BTN_L_PIN, "L   S_MGPIO15 J1902-4");
++    aim_input_diag(AIM_BTN_R_PIN, "R   S_AGPIO12 J1902-7");
++#endif
++    aim_input_config(AIM_ENC_A_PIN);
++    aim_input_config(AIM_ENC_B_PIN);
++    aim_input_config(AIM_ENC_SW_PIN);
++    osal_msleep(5); // 等配置稳定
++    // 开机采样三根线的开路电平（这段时间不要转旋钮、不要按 SW）
++    uint32_t high_a = 0;
++    uint32_t high_b = 0;
++    uint32_t high_sw = 0;
++    uint32_t samples = 0;
++    for (uint32_t t = 0; t < AIM_INPUT_IDLE_MS; t += AIM_INPUT_SAMPLE_MS) {
++        high_a += aim_pin_level(AIM_ENC_A_PIN);
++        high_b += aim_pin_level(AIM_ENC_B_PIN);
++        high_sw += aim_pin_level(AIM_ENC_SW_PIN);
++        samples++;
++        osal_msleep(AIM_INPUT_SAMPLE_MS);
++    }
++    g_aim_enc_open_mask = (uint8_t)((aim_input_open_level(high_a, samples) << 2) |
++        (aim_input_open_level(high_b, samples) << 1) | aim_input_open_level(high_sw, samples));
++    uint8_t raw = aim_enc_read();
++    printf("[AIM][ENC] init raw[A B SW]=%d%d%d open[A B SW]=%d%d%d gain=%d (没接模块时 raw 恒等于 open；闭合=与 open 相反)\n",
++        (raw >> 2) & 1, (raw >> 1) & 1, raw & 1,
++        (g_aim_enc_open_mask >> 2) & 1, (g_aim_enc_open_mask >> 1) & 1, g_aim_enc_open_mask & 1, g_aim_gain);
++
++#if AIM_ENC_IRQ
++    // 三根线都挂双边沿中断：有跳变才醒。任何一步失败就整体退回轮询，不留"半中断半轮询"的状态
++    bool irq_ok = (osal_sem_init(&g_aim_enc_sem, 0) == OSAL_SUCCESS);
++    const pin_t enc_pins[3] = { AIM_ENC_A_PIN, AIM_ENC_B_PIN, AIM_ENC_SW_PIN };
++    for (uint32_t i = 0; irq_ok && (i < 3); i++) {
++        if (uapi_gpio_register_isr_func(enc_pins[i], AIM_ENC_TRIG_BOTH_EDGES, aim_enc_isr) != ERRCODE_SUCC) {
++            irq_ok = false;
++        }
++    }
++    if (!irq_ok) {
++        for (uint32_t i = 0; i < 3; i++) {
++            (void)uapi_gpio_unregister_isr_func(enc_pins[i]);
++        }
++    }
++    printf("[AIM][ENC] sample mode: %s\n", irq_ok ? "edge-irq (wake on A/B/SW edges)" : "poll (irq unavailable)");
++#else
++    const bool irq_ok = false;
++    printf("[AIM][ENC] sample mode: poll (AIM_ENC_IRQ=0)\n");
++#endif
++    g_aim_enc_timeout_ms = aim_enc_service((uint32_t)osal_get_jiffies());
++    while (1) {
++        if (!irq_ok) {
++            osal_msleep(AIM_ENC_POLL_MS);
++        } else if (g_aim_enc_timeout_ms != 0) {
++            (void)osal_sem_down_timeout(&g_aim_enc_sem, g_aim_enc_timeout_ms); // 到点，或被边沿提前唤醒
++        } else {
++            (void)osal_sem_down(&g_aim_enc_sem); // 只等边沿
++        }
++        g_aim_enc_timeout_ms = aim_enc_service((uint32_t)osal_get_jiffies());
++    }
++    return 0;
++}
++
++static void aim_enc_start(void)
++{
++    if (g_aim_enc_task != NULL) {
++        return;
++    }
++    osal_kthread_init init = {
++        .handler = aim_enc_task,
++        .taskprio = AIM_ENC_PRIO,
++        .stacksize = AIM_ENC_STACK,
++        .taskname = "aim_enc",
++        .data = NULL,
++        .policy = OSAL_THREAD_POLICY_DEFAULT,
++    };
++    g_aim_enc_task = osal_kthread_create_ext(&init);
++    printf("[AIM][ENC] task %s\n", g_aim_enc_task != NULL ? "created" : "create FAILED");
++}
++
 +// ================= ICM20948 最小驱动（M1/M2 验证版） =================
-+// J1901-11/12 = I2C0_SCL/SDA(MGPIO_4/5)，电平 SW1901-5 默认 OFF=3.3V；地址 0x68（AD0 悬空）。
++// J1901 第11/12脚(丝印 C0_C/C0_D) = I2C0_SCL/SDA(MGPIO_4/5)，电平 SW1901-5 默认 OFF=3.3V；地址 0x68（AD0 悬空）。
 +#define AIM_IMU_BUS   0
 +#define AIM_IMU_ADDR  0x68
 +#define AIM_IMU_WHOAMI_REG 0x00 // bank0，期望 0xEA
@@ -1453,7 +1782,7 @@ index 2f6d27a2b..a8583aad2 100644
 +static double g_aim_rpy_last[3] = {0};
 +static uint32_t g_aim_moved_px = 0;
 +#define AIM_EKF_FS        100.0                    // 采样率 Hz（与任务节拍一致，联动 AIM_DEMO_TICK_MS）
-+#define AIM_RATE_GAIN     50.0                     // px/deg（用户指定 50）
++#define AIM_RATE_GAIN     ((double)g_aim_gain)         // px/deg：运行时值（默认 AIM_GAIN_DEFAULT，编码器旋钮可调）
 +#define AIM_DEADBAND_DEG  0.03                     // 单拍姿态增量死区
 +
 +#define AIM_ACC_LSB_PER_G 16384.0                  // ±2g（配置寄存器未生效的默认量程，重力实测校准）
@@ -1478,19 +1807,39 @@ index 2f6d27a2b..a8583aad2 100644
 +#define AIM_GYRO_LPF_K     0.8    // 轻滤波系数（τ≈1.25ms @100Hz）
 +#endif
 +
++// 一拍真实经过的时间上限：更长的停顿（退避、卡顿）不折算成运动，免得光标跳一下
++#define AIM_DT_MAX_S      0.05
++
++// 亚像素累积：一拍的位移常常不到 1 像素，直接取整会把零头扔掉（慢速时每拍都是 0，光标不动）。
++// 零头留到下一拍一起算，慢速也能匀速出点，总位移准确
++static double g_aim_px_acc_x = 0;
++static double g_aim_px_acc_y = 0;
++
 +// 一拍：读 IMU→(EKF|直出)→输出 dx,dy（返回 false = 传感器读失败）
 +static bool aim_ekf_step(int16_t *dx_out, int16_t *dy_out)
 +{
 +    uint8_t raw[14] = {0};
 +    *dx_out = 0;
 +    *dy_out = 0;
++    // 位移按这一拍真实经过的时间积分。循环偶尔晚醒（调度、打印）时，这一拍走完它该走的距离；
++    // 旧写法固定按 1/100 秒算，循环一慢光标就缩水成"动一下、停一下"
++    static uint64_t last_us = 0;
++    uint64_t now_us = uapi_tcxo_get_us();
++    double dt = (last_us == 0) ? (1.0 / AIM_EKF_FS) : (double)(now_us - last_us) * 1e-6;
++    last_us = now_us;
++    if (dt > AIM_DT_MAX_S) {
++        dt = AIM_DT_MAX_S;
++    }
 +    if (aim_imu_read_regs(AIM_IMU_DATA_REG, raw, 14) != ERRCODE_SUCC) {
 +        return false;
 +    }
 +    double acc[3], gyr[3];
 +    for (int i = 0; i < 3; i++) {
 +        int16_t a = (int16_t)((raw[i * 2] << 8) | raw[i * 2 + 1]);
-+        int16_t g = (int16_t)((raw[6 + i * 2] << 8) | raw[7 + i * 2 + 1]);
++        // 陀螺仪 XYZ 依次占 raw[6..11]。低字节下标曾写成 raw[7 + i * 2 + 1]（取到了下一个轴的高字节，
++        // Z 轴取到温度的高字节），从初次提交起就错：每个轴只有高 8 位有效，读数被粗化成约 2°/s 一档，
++        // 慢转时光标在 0 和 29°/s 之间跳。2026-11-24 由 Mac 端运动仿真（tools/motion_sim）查出
++        int16_t g = (int16_t)((raw[6 + i * 2] << 8) | raw[6 + i * 2 + 1]);
 +        acc[i] = (double)a / AIM_ACC_LSB_PER_G * AIM_G;          // → m/s²
 +        gyr[i] = (double)g / AIM_GYRO_LSB_DPS * AIM_D2R;         // → rad/s
 +    }
@@ -1512,18 +1861,18 @@ index 2f6d27a2b..a8583aad2 100644
 +    }
 +    double norm_dps = sqrt(corr[0] * corr[0] + corr[1] * corr[1] + corr[2] * corr[2]) / AIM_D2R;
 +    if (norm_dps < AIM_STILL_DPS) {
-+        g_aim_still_time += 1.0 / AIM_EKF_FS;
++        g_aim_still_time += dt;
 +        if (g_aim_still_time >= AIM_STILL_HOLD_S) {
 +            // 静止：EMA 缓慢跟踪零偏，输出归零
 +            for (int i = 0; i < 3; i++) {
 +                g_aim_gyro_bias_rad[i] += AIM_BIAS_EMA * (gyr[i] - g_aim_gyro_bias_rad[i]);
 +            }
-+            g_aim_moved_px += 0;
-+            return true;
 +        }
-+    } else {
-+        g_aim_still_time = 0;
++        // 低于静止判据的拍不积分。零头会跨拍累积，这里若照常积分，停下后那 0.3 秒的残余角速度
++        //（手抖、零偏）就会变成几个像素的可见漂移。旧版每拍取整把零头扔了，所以看不出这个问题
++        return true;
 +    }
++    g_aim_still_time = 0;
 +    // 延迟分段测量打点：甩动(>150°/s)瞬间打印——对照甩动动作看 [SNAP] 出现延迟=传感器+固件段
 +    static uint32_t snap_armed = 1;
 +    if (snap_armed && norm_dps > 150.0) {
@@ -1536,9 +1885,12 @@ index 2f6d27a2b..a8583aad2 100644
 +    {
 +        double dps_z = corr[2] / AIM_D2R; // 绕 Z（deg/s）
 +        double dps_x = corr[0] / AIM_D2R; // 绕 X（deg/s）
-+        double dt = 1.0 / AIM_EKF_FS;
-+        dx = -dps_z * AIM_RATE_GAIN * dt; // 轴映射沿用实测定稿：绕Z→dx 反号
-+        dy = dps_x * AIM_RATE_GAIN * dt;  // 绕X→dy 正号
++        g_aim_px_acc_x += -dps_z * AIM_RATE_GAIN * dt; // 轴映射沿用实测定稿：绕Z→dx 反号
++        g_aim_px_acc_y += dps_x * AIM_RATE_GAIN * dt;  // 绕X→dy 正号
++        dx = (double)(int)g_aim_px_acc_x; // 只取整数像素，零头留在累加器里
++        dy = (double)(int)g_aim_px_acc_y;
++        g_aim_px_acc_x -= dx;
++        g_aim_px_acc_y -= dy;
 +    }
 +#else
 +    ekf7_output o;
@@ -1696,6 +2048,127 @@ index 2f6d27a2b..a8583aad2 100644
 +    }
 +}
 +
++// 待发位移（像素）：这一拍发不出去（退避中、写失败）就留到下一拍接着发，运动不丢。上限 = 单包能带的最大位移
++#define AIM_PKT_MAX_DELTA 127
++static int32_t g_aim_pend_x = 0;
++static int32_t g_aim_pend_y = 0;
++
++static void aim_pend_clamp(int32_t *v)
++{
++    if (*v > AIM_PKT_MAX_DELTA) {
++        *v = AIM_PKT_MAX_DELTA;
++    }
++    if (*v < -AIM_PKT_MAX_DELTA) {
++        *v = -AIM_PKT_MAX_DELTA;
++    }
++}
++
++// ================= 主循环诊断（AT+AIM 读结果，AT+AIMDBG=<mask> 运行时开关） =================
++// 2026-11-24 上板：连上 dongle 且空闲时，主循环每约 25 拍卡一次、每次约 600ms；同时 AT 任务全程 1.4ms 响应，
++// 说明系统没冻住，只是这个任务被挡住。为避免靠反复烧录找原因，这里记下每一步的耗时，并留出运行时开关逐项排除。
++// mask 位：0x1 不读按键；0x2 查连接改用回调置的标志（不调 bt_sle_is_connected）；0x4 不读 IMU；0x8 不跑连接状态机；
++//          0x10 空闲时也强制发包（验证"发包时循环是否变快"）。
++#define AIM_DBG_NO_BTN      0x1U
++#define AIM_DBG_CACHED_CONN 0x2U
++#define AIM_DBG_NO_IMU      0x4U
++#define AIM_DBG_NO_FSM      0x8U
++#define AIM_DBG_FORCE_TX    0x10U
++volatile uint32_t g_aim_dbg_mask = 0;
++volatile uint8_t g_aim_conn_flag = 0; // 由 sle_com.c 的连接状态回调置位/清零
++
++#define AIM_DBG_STEP_NUM 6
++#define AIM_DBG_STEP_FSM   0
++#define AIM_DBG_STEP_IMU   1
++#define AIM_DBG_STEP_CONN  2
++#define AIM_DBG_STEP_BTN   3
++#define AIM_DBG_STEP_WRITE 4
++#define AIM_DBG_STEP_STAT  5
++static const char *const g_aim_dbg_step_name[AIM_DBG_STEP_NUM] = { "fsm", "imu", "conn", "btn", "write", "stat" };
++static uint32_t g_aim_dbg_max_us[AIM_DBG_STEP_NUM];
++static uint64_t g_aim_dbg_sum_us[AIM_DBG_STEP_NUM];
++static uint32_t g_aim_dbg_cnt[AIM_DBG_STEP_NUM];
++static uint32_t g_aim_dbg_slow[AIM_DBG_STEP_NUM]; // 这一步耗时超过 20ms 的次数
++static uint32_t g_aim_dbg_iters;                  // 统计期内的拍数
++static uint32_t g_aim_dbg_gap[5]; // 相邻两拍唤醒间隔的分布：<=11, 12-50, 51-200, 201-500, >500 (ms)
++static uint32_t g_aim_dbg_gap_max_ms;
++static uint32_t g_aim_dbg_gap_excess_ms;  // 间隔超出 10ms 的总时间
++static uint32_t g_aim_dbg_slp_over_max_us; // osal_msleep 比要求的多睡的最长时间
++
++static inline uint32_t aim_dbg_now_us(void)
++{
++    return (uint32_t)uapi_tcxo_get_us();
++}
++
++static bool aim_dbg_on(uint32_t bit)
++{
++    return (g_aim_dbg_mask & bit) != 0;
++}
++
++// 记一次某步骤的耗时（t0_us 是进入这一步前的时刻）
++static void aim_dbg_record(uint32_t step, uint32_t t0_us)
++{
++    uint32_t d = aim_dbg_now_us() - t0_us;
++    if (d > g_aim_dbg_max_us[step]) {
++        g_aim_dbg_max_us[step] = d;
++    }
++    g_aim_dbg_sum_us[step] += d;
++    g_aim_dbg_cnt[step]++;
++    if (d > 20000) {
++        g_aim_dbg_slow[step]++;
++    }
++}
++
++static void aim_dbg_reset(void)
++{
++    for (uint32_t i = 0; i < AIM_DBG_STEP_NUM; i++) {
++        g_aim_dbg_max_us[i] = 0;
++        g_aim_dbg_sum_us[i] = 0;
++        g_aim_dbg_cnt[i] = 0;
++        g_aim_dbg_slow[i] = 0;
++    }
++    for (uint32_t i = 0; i < 5; i++) {
++        g_aim_dbg_gap[i] = 0;
++    }
++    g_aim_dbg_iters = 0;
++    g_aim_dbg_gap_max_ms = 0;
++    g_aim_dbg_gap_excess_ms = 0;
++    g_aim_dbg_slp_over_max_us = 0;
++}
++
++// AT+AIM：主循环每一步的最大/平均耗时、卡住的次数，以及唤醒间隔分布。读完清零
++at_ret_t at_aim_report(void)
++{
++    uint32_t iters = g_aim_dbg_iters;
++    printf("[AIM][DBG] iters=%u mask=0x%x conn_flag=%d handle=0x%x\n", iters, (unsigned)g_aim_dbg_mask,
++        (int)g_aim_conn_flag, (unsigned)g_aim_write_handle);
++    printf("[AIM][DBG] step    max_ms   avg_ms  n>20ms\n");
++    for (uint32_t i = 0; i < AIM_DBG_STEP_NUM; i++) {
++        uint32_t max_us = g_aim_dbg_max_us[i];
++        uint64_t sum_us = g_aim_dbg_sum_us[i];
++        uint32_t n = g_aim_dbg_cnt[i];
++        uint32_t avg_us = (n != 0) ? (uint32_t)(sum_us / n) : 0;
++        printf("[AIM][DBG] %-6s %4u.%03u  %4u.%03u  %u\n", g_aim_dbg_step_name[i], max_us / 1000, max_us % 1000,
++            avg_us / 1000, avg_us % 1000, g_aim_dbg_slow[i]);
++    }
++    printf("[AIM][DBG] wake gap ms: <=11:%u 12-50:%u 51-200:%u 201-500:%u >500:%u  max=%u  excess=%u\n",
++        g_aim_dbg_gap[0], g_aim_dbg_gap[1], g_aim_dbg_gap[2], g_aim_dbg_gap[3], g_aim_dbg_gap[4],
++        g_aim_dbg_gap_max_ms, g_aim_dbg_gap_excess_ms);
++    printf("[AIM][DBG] sleep overrun max %u ms\n", g_aim_dbg_slp_over_max_us / 1000);
++    aim_dbg_reset();
++    return AT_RET_OK;
++}
++
++// AT+AIMDBG=<mask>：运行时关掉主循环里的某一步，用来逐项排除（复位后恢复全开）
++at_ret_t at_aim_dbg_set(aim_dbg_args *args)
++{
++    g_aim_dbg_mask = args->mask;
++    printf("[AIM][DBG] mask=0x%x: no_btn=%d cached_conn=%d no_imu=%d no_fsm=%d force_tx=%d\n",
++        (unsigned)g_aim_dbg_mask, aim_dbg_on(AIM_DBG_NO_BTN) ? 1 : 0, aim_dbg_on(AIM_DBG_CACHED_CONN) ? 1 : 0,
++        aim_dbg_on(AIM_DBG_NO_IMU) ? 1 : 0, aim_dbg_on(AIM_DBG_NO_FSM) ? 1 : 0,
++        aim_dbg_on(AIM_DBG_FORCE_TX) ? 1 : 0);
++    return AT_RET_OK;
++}
++
 +static int aim_demo_task(void *arg)
 +{
 +    uint32_t sent = 0;
@@ -1707,7 +2180,7 @@ index 2f6d27a2b..a8583aad2 100644
 +    errcode_t imu_ret = aim_imu_init();
 +    printf("[AIM] imu init: 0x%x\n", imu_ret);
 +    aim_imu_config(); // 软复位+唤醒+量程/ODR
-+    aim_btn_init();   // 左右键 GPIO（内部上拉，零外阻）
++    aim_btn_init();   // 左右键 GPIO（开机采开路电平，约 125ms；期间不要按按键）
 +    aim_imu_report(); // 开机即读一次
 +    ekf7_pipeline_init(&g_aim_ekf, AIM_EKF_FS, 1, 0); // work_mode=1（验证态一致），六轴
 +    g_aim_ekf_init = true;
@@ -1719,46 +2192,120 @@ index 2f6d27a2b..a8583aad2 100644
 +    aim_imu_switch_bank(0);
 +    printf("[AIM][IMU] gyro_cfg=0x%02X accel_cfg=0x%02X (FS bits: 0=±250/2g 2=±500/4g)\n", gcfg, acfg);
 +    printf("[AIM] demo task ready (EKF dx/dy @%gHz, gain=%g px/deg, auto-connect)\n", AIM_EKF_FS, AIM_RATE_GAIN);
++    // 固定节拍：第 n 拍的采样时刻 = 起点 + n×10ms，到点就采样；读传感器、解码、发包、打印都不影响下一拍的时刻。
++    // 旧写法"干完活再睡 10ms"，周期其实是 10ms + 干活时间（实测约 11.8ms），还会随干活时间抖动。
++    uint32_t next_tick = (uint32_t)osal_get_jiffies();
++    uint32_t prev_tick = next_tick;
++    uint32_t loop_n = 0;   // 本统计周期的拍数（正常 100）
++    uint32_t gap_max = 0;  // 本统计周期相邻两拍的最大间隔 ms（正常 10）
++    uint32_t late_cnt = 0; // 本统计周期间隔超过 11ms 的拍数（正常 0）
 +    while (1) {
-+        osal_msleep(AIM_DEMO_TICK_MS);
++        next_tick += AIM_DEMO_TICK_MS;
++        uint32_t now_tick = (uint32_t)osal_get_jiffies();
++        uint32_t sleep_ms = 0;
++        uint32_t t_sleep = aim_dbg_now_us();
++        if ((int32_t)(next_tick - now_tick) > 0) {
++            sleep_ms = (uint32_t)(next_tick - now_tick);
++            osal_msleep(sleep_ms);
++        } else {
++            next_tick = now_tick; // 已经晚于计划时刻：从现在起重排，不连发补拍
++        }
++        uint32_t t_step = aim_dbg_now_us();
++        if (sleep_ms != 0) {
++            int32_t over = (int32_t)(t_step - t_sleep) - (int32_t)(sleep_ms * 1000);
++            if ((over > 0) && ((uint32_t)over > g_aim_dbg_slp_over_max_us)) {
++                g_aim_dbg_slp_over_max_us = (uint32_t)over;
++            }
++        }
++        now_tick = (uint32_t)osal_get_jiffies();
++        uint32_t gap = now_tick - prev_tick;
++        prev_tick = now_tick;
++        loop_n++;
++        if (gap > gap_max) {
++            gap_max = gap;
++        }
++        if (gap > (AIM_DEMO_TICK_MS + 1)) {
++            late_cnt++;
++        }
++        {
++            uint32_t bin = (gap <= 11) ? 0 : ((gap <= 50) ? 1 : ((gap <= 200) ? 2 : ((gap <= 500) ? 3 : 4)));
++            g_aim_dbg_gap[bin]++;
++            g_aim_dbg_iters++;
++            if (gap > g_aim_dbg_gap_max_ms) {
++                g_aim_dbg_gap_max_ms = gap;
++            }
++            if (gap > AIM_DEMO_TICK_MS) {
++                g_aim_dbg_gap_excess_ms += gap - AIM_DEMO_TICK_MS;
++            }
++        }
 +        // 自动连接状态机（每拍推进）
 +        bool dummy = false;
-+        aim_conn_fsm(&dummy);
-+        // EKF 无条件每拍跑：姿态解算独立于 SLE 链路（调算法不被连接状态绑架）
++        if (!aim_dbg_on(AIM_DBG_NO_FSM)) {
++            aim_conn_fsm(&dummy);
++        }
++        aim_dbg_record(AIM_DBG_STEP_FSM, t_step);
++        t_step = aim_dbg_now_us();
++        // 采样与解算无条件每拍跑：独立于 SLE 链路（调算法不被连接状态绑架）
 +        int16_t dx_now = 0;
 +        int16_t dy_now = 0;
-+        if (!aim_ekf_step(&dx_now, &dy_now)) {
++        if (!aim_dbg_on(AIM_DBG_NO_IMU) && !aim_ekf_step(&dx_now, &dy_now)) {
 +            imu_fail++;
 +        }
-+        if (++stat_div >= AIM_EKF_FS) { // 每秒打印姿态与统计
++        aim_dbg_record(AIM_DBG_STEP_IMU, t_step);
++        t_step = aim_dbg_now_us();
++        bool connected = aim_dbg_on(AIM_DBG_CACHED_CONN) ? (g_aim_conn_flag != 0) : bt_sle_is_connected();
++        aim_dbg_record(AIM_DBG_STEP_CONN, t_step);
++        t_step = aim_dbg_now_us();
++        // 本拍位移进"待发"：这一拍发不出去就留到下一拍接着发
++        g_aim_pend_x += dx_now;
++        g_aim_pend_y += dy_now;
++        aim_pend_clamp(&g_aim_pend_x);
++        aim_pend_clamp(&g_aim_pend_y);
++        if (++stat_div >= AIM_EKF_FS) { // 每 100 拍打印姿态与统计
 +            stat_div = 0;
 +            double rpy[3];
 +            ekf7_filter_euler(&g_aim_ekf.filt, rpy);
-+            printf("[AIM] rpy=[%.1f %.1f %.1f]deg moved=%upx sent=%u imu_fail=%u align=%.1f/%.0f conn=%d hdl=0x%x skip=%u\n",
++            uint8_t btn_l = aim_pin_level(AIM_BTN_L_PIN);
++            uint8_t btn_r = aim_pin_level(AIM_BTN_R_PIN);
++            printf("[AIM] rpy=[%.1f %.1f %.1f]deg moved=%upx sent=%u fail=%u imu_fail=%u align=%.1f/%.0f conn=%d hdl=0x%x skip=%u loop n=%u maxgap=%ums late=%u gain=%d enc[A B SW]=%d%d%d open=%d%d%d irq=%u btn[L R]=%d%d open=%d%d keys=%d%d\n",
 +                rpy[0] / AIM_D2R, rpy[1] / AIM_D2R, rpy[2] / AIM_D2R,
-+                g_aim_moved_px, sent, imu_fail,
++                g_aim_moved_px, sent, fail, imu_fail,
 +                g_aim_ekf.filt.init_max_time, g_aim_ekf.filt.flag_in,
-+                (int)bt_sle_is_connected(), (unsigned)g_aim_write_handle, skipped);
++                (int)connected, (unsigned)g_aim_write_handle, skipped, loop_n, gap_max, late_cnt,
++                g_aim_gain, (g_aim_enc_raw >> 2) & 1, (g_aim_enc_raw >> 1) & 1, g_aim_enc_raw & 1,
++                (g_aim_enc_open_mask >> 2) & 1, (g_aim_enc_open_mask >> 1) & 1, g_aim_enc_open_mask & 1,
++                (unsigned)g_aim_enc_irq_cnt,
++                btn_l, btn_r, g_aim_btn_open[0], g_aim_btn_open[1],
++                btn_l != g_aim_btn_open[0], btn_r != g_aim_btn_open[1]);
++            loop_n = 0;
++            gap_max = 0;
++            late_cnt = 0;
 +        }
-+        if (!bt_sle_is_connected() || g_aim_write_handle == 0) {
-+            continue; // 未连接/未发现服务时静默等待
++        aim_dbg_record(AIM_DBG_STEP_STAT, t_step);
++        t_step = aim_dbg_now_us();
++        if (!connected || g_aim_write_handle == 0) {
++            g_aim_pend_x = 0; // 未连接：待发位移丢掉，免得重连后光标跳一下
++            g_aim_pend_y = 0;
++            continue;
 +        }
-+        // 退避背压（无确认写模式）：连续失败=栈队列压力，停 20 拍（200ms）再试
++        // 退避背压（无确认写模式）：连续失败=栈队列压力，停 20 拍（200ms）再试；期间的位移留在"待发"里不丢
 +        if (g_aim_backoff > 0) {
 +            g_aim_backoff--;
 +            skipped++;
 +            continue;
 +        }
-+        // 发送：直接用本拍 EKF 输出 + 按键状态（零位移且按键无变化且无按住时不发）
++        // 发送：待发位移 + 按键状态（零位移且按键无变化且无按住时不发）
 +        aim_mouse_pkt_t pkt;
 +        pkt.magic = 0xA5;
-+        pkt.keys = aim_btn_scan();
-+        pkt.dx = dx_now;
-+        pkt.dy = dy_now;
++        pkt.keys = aim_dbg_on(AIM_DBG_NO_BTN) ? 0 : aim_btn_scan();
++        aim_dbg_record(AIM_DBG_STEP_BTN, t_step);
++        t_step = aim_dbg_now_us();
++        pkt.dx = (int16_t)g_aim_pend_x;
++        pkt.dy = (int16_t)g_aim_pend_y;
 +        static uint8_t s_prev_keys_sent = 0;
 +        bool keys_changed = (pkt.keys != s_prev_keys_sent);
 +        bool any_held = (pkt.keys != 0);
-+        if (pkt.dx == 0 && pkt.dy == 0 && !keys_changed && !any_held) {
++        if (!aim_dbg_on(AIM_DBG_FORCE_TX) && pkt.dx == 0 && pkt.dy == 0 && !keys_changed && !any_held) {
 +            continue; // 全静止：不发包
 +        }
 +        if (keys_changed) {
@@ -1767,6 +2314,8 @@ index 2f6d27a2b..a8583aad2 100644
 +        }
 +        if (sle_ssapc_write_buf(g_client_device_id, g_client_id, g_aim_write_handle,
 +            (const uint8_t *)&pkt, sizeof(pkt)) == ERRCODE_BT_SUCCESS) {
++            g_aim_pend_x -= pkt.dx; // 发出去了才从"待发"里扣掉
++            g_aim_pend_y -= pkt.dy;
 +            sent++;
 +            g_aim_fail_streak = 0;
 +        } else {
@@ -1776,6 +2325,7 @@ index 2f6d27a2b..a8583aad2 100644
 +                g_aim_fail_streak = 0;
 +            }
 +        }
++        aim_dbg_record(AIM_DBG_STEP_WRITE, t_step);
 +        if ((sent + fail + skipped) % 500 == 0) {
 +            printf("[AIM] stream: sent=%u fail=%u skip=%u bk=%u\n", sent, fail, skipped, g_aim_backoff);
 +        }
@@ -1801,6 +2351,7 @@ index 2f6d27a2b..a8583aad2 100644
 +    };
 +    g_aim_task = osal_kthread_create_ext(&init);
 +    printf("[AIM] demo task %s\n", g_aim_task != NULL ? "created" : "create FAILED");
++    aim_enc_start(); // 编码器任务（边沿中断驱动，幂等）
 +}
 +
 +// 开机自启入口（由 sle_com.c 的 at_diting_sle_example_cmd_register 调用——AT 框架初始化是 3322 的可靠开机钩子；
@@ -1813,7 +2364,7 @@ index 2f6d27a2b..a8583aad2 100644
  // 客户端应用UUID（从服务发现结果中获取）
  static bs_sle_uuid_t g_client_app_uuid = {SLE_APP_UUID_LEN, {0}};
  
-@@ -53,17 +575,18 @@ static void sle_ssap_client_read_cbk(uint16_t dev_id, uint8_t client_id, bs_sle_
+@@ -53,17 +1126,18 @@ static void sle_ssap_client_read_cbk(uint16_t dev_id, uint8_t client_id, bs_sle_
  }
  
  // SSAP客户端写操作回调函数
@@ -1840,7 +2391,7 @@ index 2f6d27a2b..a8583aad2 100644
      }
  }
  
-@@ -169,7 +692,10 @@ errcode_t sle_demo_client_init(void)
+@@ -169,7 +1243,10 @@ errcode_t sle_demo_client_init(void)
      // step4: 打印注册成功的客户端ID
      printf("[SLE SSAPC] Registered: client_id=%d\n", g_client_id);
  
@@ -1852,7 +2403,7 @@ index 2f6d27a2b..a8583aad2 100644
      return ret;
  }
  
-@@ -390,6 +916,19 @@ static void sle_ssapc_find_service_cbk(uint16_t dev_id, uint8_t client_id, uint8
+@@ -390,6 +1467,19 @@ static void sle_ssapc_find_service_cbk(uint16_t dev_id, uint8_t client_id, uint8
                          printf("%02X", service[s].property_list[i].uuid.uuid[j]);
                      }
                      printf("\n");
@@ -1872,8 +2423,64 @@ index 2f6d27a2b..a8583aad2 100644
                  }
              }
  
+diff --git a/samples/native_samples/sle/sle_client.h b/samples/native_samples/sle/sle_client.h
+index 98f90f94d..5b348eb96 100644
+--- a/samples/native_samples/sle/sle_client.h
++++ b/samples/native_samples/sle/sle_client.h
+@@ -123,6 +123,25 @@ static const at_para_parse_syntax_t g_sle_ssapc_read_syntax[] = {
+      .offset = offsetof(sle_ssapc_read_data, type)},
+ };
+ 
++// AirMouse 主循环调试开关参数结构体
++typedef struct {
++    uint32_t para_map;  // 参数映射位图
++    uint32_t mask;  // 开关位图（见 sle_client.c 的 AIM_DBG_*）
++} aim_dbg_args;
++
++// 函数声明：AirMouse 调试命令处理函数（实现与开关含义都在 sle_client.c）
++at_ret_t at_aim_report(void);  // AT+AIM：打印主循环每一步的耗时统计，读完清零
++at_ret_t at_aim_dbg_set(aim_dbg_args *args);  // AT+AIMDBG=<mask>：运行时关掉主循环里的某一步
++
++// AirMouse 调试开关命令参数解析语法表
++static const at_para_parse_syntax_t g_aim_dbg_syntax[] = {
++    {.type = AT_SYNTAX_TYPE_INT,
++     .last = true,
++     .attribute = AT_SYNTAX_ATTR_AT_MIN_VALUE | AT_SYNTAX_ATTR_AT_MAX_VALUE,
++     .entry.int_range = {0, 255},
++     .offset = offsetof(aim_dbg_args, mask)},
++};
++
+ // AT命令解析表：定义了所有SLE客户端相关的AT命令及其处理函数
+ static const at_cmd_entry_t g_at_sle_client_cmd_parse_table[] = {
+     {
+@@ -205,5 +224,25 @@ static const at_cmd_entry_t g_at_sle_client_cmd_parse_table[] = {
+         NULL,
+         NULL,
+     },
++    {
++        "AIM",  // AirMouse：打印主循环分步耗时统计（调试用）
++        0x2AF0,  // 命令码（官方表和本表都没用过的号段）
++        0,  // 参数数量
++        NULL,  // 参数解析语法（无参数）
++        at_aim_report,  // 查询处理函数
++        (at_set_func_t)NULL,  // 设置处理函数（无）
++        NULL,
++        NULL,
++    },
++    {
++        "AIMDBG",  // AirMouse：AT+AIMDBG=<mask> 运行时关掉主循环里的某一步（调试用）
++        0x2AF1,  // 命令码
++        0,  // 参数数量
++        g_aim_dbg_syntax,  // 参数解析语法
++        NULL,  // 查询处理函数（无）
++        (at_set_func_t)at_aim_dbg_set,  // 设置处理函数
++        NULL,
++        NULL,
++    },
+ };
+ #endif
 diff --git a/samples/native_samples/sle/sle_com.c b/samples/native_samples/sle/sle_com.c
-index e25ff53ab..b472a367e 100644
+index e25ff53ab..13097574a 100644
 --- a/samples/native_samples/sle/sle_com.c
 +++ b/samples/native_samples/sle/sle_com.c
 @@ -17,6 +17,10 @@ void at_diting_sle_example_cmd_register(void)
@@ -1887,3 +2494,21 @@ index e25ff53ab..b472a367e 100644
  }
  
  // 全局角色变量（默认外设角色）
+@@ -229,6 +233,8 @@ static void start_sle_adv(bs_sle_local_role_t role, bs_sle_connect_state_t conn_
+ 
+ // 处理连接状态变更回调
+ // 函数作用：更新设备ID并根据角色控制广播
++extern volatile uint8_t g_aim_conn_flag; // AirMouse：连接状态的缓存标志（定义在 sle_client.c）
++
+ static void process_sle_connect_state_changed_cb(bs_sle_connection_result_t *result)
+ {
+     errcode_t ret = 0;
+@@ -243,6 +249,8 @@ static void process_sle_connect_state_changed_cb(bs_sle_connection_result_t *res
+     osal_mutex_lock(&g_sle_stack_info_mutex);
+     g_sle_stack_info.conn_status = result->conn_state;
+     osal_mutex_unlock(&g_sle_stack_info_mutex);
++    // AirMouse：缓存连接状态，主循环调试时可以不调 bt_sle_is_connected() 而用这个标志
++    g_aim_conn_flag = (result->conn_state == SLE_CONNECT_CONNECTED) ? 1 : 0;
+ 
+     // 仅在连接建立后保存有效设备 ID；断开后清除，避免后续误用旧连接。
+     if (result->conn_state == SLE_CONNECT_CONNECTED) {
