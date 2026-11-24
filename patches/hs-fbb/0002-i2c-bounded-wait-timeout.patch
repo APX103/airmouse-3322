@@ -1,0 +1,13 @@
+diff --git a/src/build/config/target_config/3322/menuconfig/acore/diting_community.config b/src/build/config/target_config/3322/menuconfig/acore/diting_community.config
+index a18a620ad..51683e1d2 100755
+--- a/src/build/config/target_config/3322/menuconfig/acore/diting_community.config
++++ b/src/build/config/target_config/3322/menuconfig/acore/diting_community.config
+@@ -229,7 +229,7 @@ CONFIG_DRIVER_SUPPORT_I2C=y
+ #
+ CONFIG_I2C_SUPPORT_MASTER=y
+ CONFIG_I2C_SUPPORT_SLAVE=y
+-CONFIG_I2C_WAIT_CONDITION_TIMEOUT=0xFFFFFFFF
++CONFIG_I2C_WAIT_CONDITION_TIMEOUT=0x64
+ CONFIG_I2C_SUPPORT_INT=y
+ # CONFIG_I2C_SUPPORT_IN_CHIP_LOOPBACK is not set
+ CONFIG_I2C_SUPPORT_DMA=y

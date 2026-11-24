@@ -86,7 +86,6 @@ static void pipeline_reset(void)
 {
     g_aim_gyro_lpf_init = false;
     g_aim_gyro_bias_rad[0] = g_aim_gyro_bias_rad[1] = g_aim_gyro_bias_rad[2] = 0;
-    g_aim_still_time = 0;
     g_aim_px_acc_x = g_aim_px_acc_y = 0;
     counters_reset();
 }
@@ -141,8 +140,8 @@ static long ideal(double dps, double seconds)
 int main(void)
 {
     g_aim_gain = AIM_GAIN_DEFAULT;
-    printf("config: gain=%d px/deg tick=%ums still gate=%.1f deg/s held %.1fs dt cap=%dms\n", AIM_GAIN_DEFAULT,
-        k_tick_ms, AIM_STILL_DPS, AIM_STILL_HOLD_S, (int)(AIM_DT_MAX_S * 1000));
+    printf("config: gain=%d px/deg tick=%ums still gate=%.1f deg/s bias EMA=%.2f dt cap=%dms\n", AIM_GAIN_DEFAULT,
+        k_tick_ms, AIM_STILL_DPS, AIM_BIAS_EMA, (int)(AIM_DT_MAX_S * 1000));
 
     /* 1. slow turn, 2 deg/s for 2 s: below the old dead zone (a 10 ms step was < 1 px) */
     pipeline_reset();

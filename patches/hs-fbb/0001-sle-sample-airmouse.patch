@@ -1274,7 +1274,7 @@ index 000000000..cdadb7e7d
 +    out->motionless = motionless_flag;
 +}
 diff --git a/samples/native_samples/sle/sle_client.c b/samples/native_samples/sle/sle_client.c
-index 2f6d27a2b..e93499c56 100644
+index 2f6d27a2b..6dc473445 100644
 --- a/samples/native_samples/sle/sle_client.c
 +++ b/samples/native_samples/sle/sle_client.c
 @@ -6,6 +6,16 @@
@@ -1294,7 +1294,7 @@ index 2f6d27a2b..e93499c56 100644
  
  // 默认的中心设备MAC地址（用于配置本地地址）
  #define SLE_CONFIG_CONN_DEMO_CENTRAL_ADDR  \
-@@ -25,6 +35,1069 @@ static uint8_t g_client_id = 0;
+@@ -25,6 +35,1088 @@ static uint8_t g_client_id = 0;
  // 客户端设备ID（连接后分配）
  uint16_t g_client_device_id = 0;
  
@@ -2245,11 +2245,27 @@ index 2f6d27a2b..e93499c56 100644
 +        }
 +        aim_dbg_record(AIM_DBG_STEP_FSM, t_step);
 +        t_step = aim_dbg_now_us();
-+        // 采样与解算无条件每拍跑：独立于 SLE 链路（调算法不被连接状态绑架）
++        // 采样与解算无条件每拍跑：独立于 SLE 链路（调算法不被连接状态绑架）。
++        // 实时环的防卡死层（0002 补丁把驱动等待改回 100ms 有限值）：读失败静默一拍再试；
++        // 真实读 14B@400kHz 至少 ~340us，比这还快的"成功"= 驱动信号量被上一拍迟到的完成事件
++        // 提前放行、缓冲区是半截数据（只在发生过超时类错误后才可能出现），当失败丢弃
++        static uint8_t imu_quiet = 0;
 +        int16_t dx_now = 0;
 +        int16_t dy_now = 0;
-+        if (!aim_dbg_on(AIM_DBG_NO_IMU) && !aim_ekf_step(&dx_now, &dy_now)) {
-+            imu_fail++;
++        if (imu_quiet != 0) {
++            imu_quiet--;
++        } else if (!aim_dbg_on(AIM_DBG_NO_IMU)) {
++            uint32_t t_imu = aim_dbg_now_us();
++            bool ok = aim_ekf_step(&dx_now, &dy_now);
++            if (ok && (aim_dbg_now_us() - t_imu < 250)) {
++                dx_now = 0;
++                dy_now = 0;
++                ok = false;
++            }
++            if (!ok) {
++                imu_fail++;
++                imu_quiet = 1;
++            }
 +        }
 +        aim_dbg_record(AIM_DBG_STEP_IMU, t_step);
 +        t_step = aim_dbg_now_us();
@@ -2288,13 +2304,8 @@ index 2f6d27a2b..e93499c56 100644
 +            g_aim_pend_y = 0;
 +            continue;
 +        }
-+        // 退避背压（无确认写模式）：连续失败=栈队列压力，停 20 拍（200ms）再试；期间的位移留在"待发"里不丢
-+        if (g_aim_backoff > 0) {
-+            g_aim_backoff--;
-+            skipped++;
-+            continue;
-+        }
-+        // 发送：待发位移 + 按键状态（零位移且按键无变化且无按住时不发）
++        // 退避背压（无确认写模式）：连续失败=栈队列压力，停 20 拍（200ms）再试；期间的位移留在"待发"里不丢。
++        // 退避只挡位移包：按键沿（点击/松开）不等退避，点击延迟比位移积压更可感，写失败自然续期
 +        aim_mouse_pkt_t pkt;
 +        pkt.magic = 0xA5;
 +        pkt.keys = aim_dbg_on(AIM_DBG_NO_BTN) ? 0 : aim_btn_scan();
@@ -2305,17 +2316,25 @@ index 2f6d27a2b..e93499c56 100644
 +        static uint8_t s_prev_keys_sent = 0;
 +        bool keys_changed = (pkt.keys != s_prev_keys_sent);
 +        bool any_held = (pkt.keys != 0);
-+        if (!aim_dbg_on(AIM_DBG_FORCE_TX) && pkt.dx == 0 && pkt.dy == 0 && !keys_changed && !any_held) {
++        if (g_aim_backoff > 0) {
++            if (!keys_changed) {
++                g_aim_backoff--;
++                skipped++;
++                continue;
++            }
++        } else if (!aim_dbg_on(AIM_DBG_FORCE_TX) && pkt.dx == 0 && pkt.dy == 0 && !keys_changed && !any_held) {
 +            continue; // 全静止：不发包
 +        }
 +        if (keys_changed) {
-+            s_prev_keys_sent = pkt.keys;
 +            printf("[AIM][BTN] keys=0x%x\n", pkt.keys); // 按键沿：串口可见（调试期）
 +        }
 +        if (sle_ssapc_write_buf(g_client_device_id, g_client_id, g_aim_write_handle,
 +            (const uint8_t *)&pkt, sizeof(pkt)) == ERRCODE_BT_SUCCESS) {
 +            g_aim_pend_x -= pkt.dx; // 发出去了才从"待发"里扣掉
 +            g_aim_pend_y -= pkt.dy;
++            if (keys_changed) {
++                s_prev_keys_sent = pkt.keys; // 发出去才记：写失败的按键沿下一拍还能重试，快速点按不丢
++            }
 +            sent++;
 +            g_aim_fail_streak = 0;
 +        } else {
@@ -2364,7 +2383,7 @@ index 2f6d27a2b..e93499c56 100644
  // 客户端应用UUID（从服务发现结果中获取）
  static bs_sle_uuid_t g_client_app_uuid = {SLE_APP_UUID_LEN, {0}};
  
-@@ -53,17 +1126,18 @@ static void sle_ssap_client_read_cbk(uint16_t dev_id, uint8_t client_id, bs_sle_
+@@ -53,17 +1145,18 @@ static void sle_ssap_client_read_cbk(uint16_t dev_id, uint8_t client_id, bs_sle_
  }
  
  // SSAP客户端写操作回调函数
@@ -2391,7 +2410,7 @@ index 2f6d27a2b..e93499c56 100644
      }
  }
  
-@@ -169,7 +1243,10 @@ errcode_t sle_demo_client_init(void)
+@@ -169,7 +1262,10 @@ errcode_t sle_demo_client_init(void)
      // step4: 打印注册成功的客户端ID
      printf("[SLE SSAPC] Registered: client_id=%d\n", g_client_id);
  
@@ -2403,7 +2422,7 @@ index 2f6d27a2b..e93499c56 100644
      return ret;
  }
  
-@@ -390,6 +1467,19 @@ static void sle_ssapc_find_service_cbk(uint16_t dev_id, uint8_t client_id, uint8
+@@ -390,6 +1486,19 @@ static void sle_ssapc_find_service_cbk(uint16_t dev_id, uint8_t client_id, uint8
                          printf("%02X", service[s].property_list[i].uuid.uuid[j]);
                      }
                      printf("\n");
