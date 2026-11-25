@@ -1274,7 +1274,7 @@ index 000000000..cdadb7e7d
 +    out->motionless = motionless_flag;
 +}
 diff --git a/samples/native_samples/sle/sle_client.c b/samples/native_samples/sle/sle_client.c
-index 2f6d27a2b..2a0cdfc67 100644
+index 2f6d27a2b..c143a5098 100644
 --- a/samples/native_samples/sle/sle_client.c
 +++ b/samples/native_samples/sle/sle_client.c
 @@ -6,6 +6,16 @@
@@ -1380,13 +1380,13 @@ index 2f6d27a2b..2a0cdfc67 100644
 +}
 +
 +// ================= 鼠标左右键（feat/buttons） =================
-+// J1902 第4脚(丝印 CS) = S_MGPIO15(左键)、第7脚(丝印 RX4) = S_AGPIO12(右键)。按钮一脚接排针，另一脚接哪要按各脚的空脚电平选
++// 左键 = TX3(S_AGPIO7, J1902 第11脚)接地式；右键 = RX4(S_AGPIO12, 第7脚)接地式。两只脚空闲高电平，按下拉低（2026-11-26 起左键从 CS/3.3V 方案迁来：3.3V 引脚被编码器+IMU 占满）
 +// （2026-11-24 实测：左键脚空脚读 0、右键脚空脚读 1）：闭合 = 电平与空脚相反，
 +// 所以 左键另一脚接 3.3V(PIN17)，右键另一脚接 GND(PIN5/6)；反过来接闭合前后电平不变，等于没接。
 +// keys 位语义：bit0=左键 bit1=右键（bit2=Q bit3=E 预留）。
 +// pin_t 枚举名出自 drivers/boards/3322_evb/product/product_pin.h（编译实证链）；
 +// 若枚举不可见则退回数值 47/87。
-+#define AIM_BTN_L_PIN S_MGPIO15
++#define AIM_BTN_L_PIN S_AGPIO20   // A_20（J1902 第 14 脚；U1805 同款空闲高，按下接地。TX3 实测同 TX4 被钉死 0 弃用）
 +#define AIM_BTN_R_PIN S_AGPIO12
 +
 +static uint8_t g_aim_btn_open[2] = {0, 0}; // 左/右键脚的开路电平
@@ -1440,7 +1440,7 @@ index 2f6d27a2b..2a0cdfc67 100644
 +#define AIM_ENC_PRIO     5     // 数值小=优先级高；高于 aim_demo(6)，边沿来了立刻读引脚（不高于系统关键任务区 2~4）
 +#define AIM_ENC_IRQ      0     // 2026-11-25 实测：AGPIO 边沿中断注册成功但永不触发（旋转时 irq=0、电平变化只能靠统计行轮询看到），退回 10ms 轮询；p5+10ms 占空约 0.1%，v8.1 动态优先级下无碍
 +#define AIM_ENC_TRIG_BOTH_EDGES 0x3U // hal_gpio.h 的 GPIO_INTERRUPT_DEDGE = 上升沿(0x1) | 下降沿(0x2)
-+#define AIM_ENC_POLL_MS  10    // AIM_ENC_IRQ=0 时的轮询周期
++#define AIM_ENC_POLL_MS  1     // 2026-11-25 定稿：手拧 EC11 边沿间隔仅几 ms，10ms 采样漏掉大部分边沿（用户 Pico 实录同款教训：中断丢一半、改密轮询）；LiteOS tick 1ms+补偿 → 实际约 2ms/500Hz，任务占空 <1%
 +#define AIM_ENC_REST_MS  100   // 停在定位点（A、B 都断开）超过此时长，清掉漏采留下的半格计数
 +#define AIM_ENC_STEPS_PER_DETENT 4  // 一格 = A/B 走完一个周期（4 次合法跳变）；若实测"两格才变一次"改成 2
 +#define AIM_ENC_SW_DEBOUNCE_MS 20   // 按键消抖窗（ms）
