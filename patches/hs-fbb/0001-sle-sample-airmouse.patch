@@ -1379,34 +1379,43 @@ index 2f6d27a2b..c143a5098 100644
 +        highs[0], AIM_INPUT_DIAG_N, highs[1], AIM_INPUT_DIAG_N, highs[2], AIM_INPUT_DIAG_N);
 +}
 +
-+// ================= 鼠标左右键（feat/buttons） =================
-+// 左键 = TX3(S_AGPIO7, J1902 第11脚)接地式；右键 = RX4(S_AGPIO12, 第7脚)接地式。两只脚空闲高电平，按下拉低（2026-11-26 起左键从 CS/3.3V 方案迁来：3.3V 引脚被编码器+IMU 占满）
-+// （2026-11-24 实测：左键脚空脚读 0、右键脚空脚读 1）：闭合 = 电平与空脚相反，
-+// 所以 左键另一脚接 3.3V(PIN17)，右键另一脚接 GND(PIN5/6)；反过来接闭合前后电平不变，等于没接。
-+// keys 位语义：bit0=左键 bit1=右键（bit2=Q bit3=E 预留）。
-+// pin_t 枚举名出自 drivers/boards/3322_evb/product/product_pin.h（编译实证链）；
-+// 若枚举不可见则退回数值 47/87。
++// ================= 鼠标三个键（feat/buttons → feat/center-key） =================
++// 左键 = A_20(S_AGPIO20, J1902 第14脚)接地式；右键 = RX4(S_AGPIO12, 第7脚)接地式：空闲高电平，按下拉低。
++// 置中键 = 板上"自定义按键" SW2102（丝印 AIO17_KEY）= S_AGPIO17，零接线（2026-11-27 原理图 21_KEY 页实锤）。
++//   板上电路：开关接地 + 100nF 电容到地 + ESD3V3A 防静电 + 0Ω 串联（"电阻保护"的接地式触发）；无外部上拉，
++//   空闲高靠芯片内部上拉（开机采样在电容充电完成之后，稳定）。100nF 兼硬件消抖。
++//   置中语义在 PC 侧：dongle 原样透传 bit2=中键，tools/win32/center_agent.py 钩中键按下→光标置屏幕中心并吞键；
++//   agent 没运行时置中键=普通中键。
++// 备用：板上还有一个同电路按键 SW2103 = S_AGPIO2（丝印在中键位，引脚号 77），以后加第 4/5 键直接用。
++// keys 位语义：bit0=左键 bit1=右键 bit2=置中键（中键）。
++// pin_t 枚举名出自 drivers/boards/3322_evb/product/product_pin.h（编译实证链，n+MGPIO=32+n、AGPIO=75+n）；
++// 若枚举不可见则退回数值 95/87/92。
 +#define AIM_BTN_L_PIN S_AGPIO20   // A_20（J1902 第 14 脚；U1805 同款空闲高，按下接地。TX3 实测同 TX4 被钉死 0 弃用）
-+#define AIM_BTN_R_PIN S_AGPIO12
++#define AIM_BTN_R_PIN S_AGPIO12   // RX4（J1902 第 7 脚）
++#define AIM_BTN_M_PIN S_AGPIO17   // 板上自定义按键 SW2102（AIO17_KEY），接地式，零接线
 +
-+static uint8_t g_aim_btn_open[2] = {0, 0}; // 左/右键脚的开路电平
++static uint8_t g_aim_btn_open[3] = {0, 0, 0}; // 左/右/置中键脚的开路电平
 +
 +static void aim_btn_init(void)
 +{
 +    aim_input_config(AIM_BTN_L_PIN);
 +    aim_input_config(AIM_BTN_R_PIN);
++    aim_input_config(AIM_BTN_M_PIN);
 +    osal_msleep(5); // 等配置稳定
 +    uint32_t high_l = 0;
 +    uint32_t high_r = 0;
++    uint32_t high_m = 0;
 +    uint32_t samples = 0;
 +    for (uint32_t t = 0; t < AIM_INPUT_IDLE_MS; t += AIM_INPUT_SAMPLE_MS) {
 +        high_l += aim_pin_level(AIM_BTN_L_PIN);
 +        high_r += aim_pin_level(AIM_BTN_R_PIN);
++        high_m += aim_pin_level(AIM_BTN_M_PIN);
 +        samples++;
 +        osal_msleep(AIM_INPUT_SAMPLE_MS);
 +    }
 +    g_aim_btn_open[0] = aim_input_open_level(high_l, samples);
 +    g_aim_btn_open[1] = aim_input_open_level(high_r, samples);
++    g_aim_btn_open[2] = aim_input_open_level(high_m, samples);
 +}
 +
 +// 2 拍一致消抖（100Hz 下 20ms 窗）；返回 keys 位图。电平与开路电平相反 = 按下
@@ -1417,6 +1426,7 @@ index 2f6d27a2b..c143a5098 100644
 +    uint8_t raw = 0;
 +    if (aim_pin_level(AIM_BTN_L_PIN) != g_aim_btn_open[0]) { raw |= 0x01; }
 +    if (aim_pin_level(AIM_BTN_R_PIN) != g_aim_btn_open[1]) { raw |= 0x02; }
++    if (aim_pin_level(AIM_BTN_M_PIN) != g_aim_btn_open[2]) { raw |= 0x04; }
 +    if (raw == prev_raw) {
 +        stable = raw;
 +    }
@@ -1611,8 +1621,9 @@ index 2f6d27a2b..c143a5098 100644
 +    aim_input_diag(AIM_ENC_A_PIN, "SIA RX3 S_AGPIO8 J1902-13");
 +    aim_input_diag(AIM_ENC_B_PIN, "SIB CTS4 S_AGPIO13 J1902-8");
 +    aim_input_diag(AIM_ENC_SW_PIN, "SW  RTS4 S_AGPIO14 J1902-10");
-+    aim_input_diag(AIM_BTN_L_PIN, "L   S_MGPIO15 J1902-4");
++    aim_input_diag(AIM_BTN_L_PIN, "L   S_AGPIO20 A_20 J1902-14");
 +    aim_input_diag(AIM_BTN_R_PIN, "R   S_AGPIO12 J1902-7");
++    aim_input_diag(AIM_BTN_M_PIN, "M   S_AGPIO17 onboard SW2102");
 +#endif
 +    aim_input_config(AIM_ENC_A_PIN);
 +    aim_input_config(AIM_ENC_B_PIN);
@@ -2297,7 +2308,8 @@ index 2f6d27a2b..c143a5098 100644
 +            ekf7_filter_euler(&g_aim_ekf.filt, rpy);
 +            uint8_t btn_l = aim_pin_level(AIM_BTN_L_PIN);
 +            uint8_t btn_r = aim_pin_level(AIM_BTN_R_PIN);
-+            printf("[AIM] rpy=[%.1f %.1f %.1f]deg moved=%upx sent=%u fail=%u imu_fail=%u align=%.1f/%.0f conn=%d hdl=0x%x skip=%u loop n=%u maxgap=%ums late=%u gain=%d enc[A B SW]=%d%d%d open=%d%d%d irq=%u btn[L R]=%d%d open=%d%d keys=%d%d\n",
++            uint8_t btn_m = aim_pin_level(AIM_BTN_M_PIN);
++            printf("[AIM] rpy=[%.1f %.1f %.1f]deg moved=%upx sent=%u fail=%u imu_fail=%u align=%.1f/%.0f conn=%d hdl=0x%x skip=%u loop n=%u maxgap=%ums late=%u gain=%d enc[A B SW]=%d%d%d open=%d%d%d irq=%u btn[L R M]=%d%d%d open=%d%d%d keys=%d%d%d\n",
 +                rpy[0] / AIM_D2R, rpy[1] / AIM_D2R, rpy[2] / AIM_D2R,
 +                g_aim_moved_px, sent, fail, imu_fail,
 +                g_aim_ekf.filt.init_max_time, g_aim_ekf.filt.flag_in,
@@ -2305,8 +2317,8 @@ index 2f6d27a2b..c143a5098 100644
 +                g_aim_gain, (g_aim_enc_raw >> 2) & 1, (g_aim_enc_raw >> 1) & 1, g_aim_enc_raw & 1,
 +                (g_aim_enc_open_mask >> 2) & 1, (g_aim_enc_open_mask >> 1) & 1, g_aim_enc_open_mask & 1,
 +                (unsigned)g_aim_enc_irq_cnt,
-+                btn_l, btn_r, g_aim_btn_open[0], g_aim_btn_open[1],
-+                btn_l != g_aim_btn_open[0], btn_r != g_aim_btn_open[1]);
++                btn_l, btn_r, btn_m, g_aim_btn_open[0], g_aim_btn_open[1], g_aim_btn_open[2],
++                btn_l != g_aim_btn_open[0], btn_r != g_aim_btn_open[1], btn_m != g_aim_btn_open[2]);
 +            loop_n = 0;
 +            gap_max = 0;
 +            late_cnt = 0;

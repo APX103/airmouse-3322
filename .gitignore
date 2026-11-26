@@ -12,3 +12,10 @@ downloads/
 .v2c/
 .video_agent/
 .DS_Store
+
+# 仿真工具产物（extract.py 运行时生成 / 编译输出，重跑 run.sh 即重建）
+tools/*/*.inc
+tools/*/btn_sim
+tools/*/enc_sim
+tools/*/motion_sim
+tools/*/*.exe
