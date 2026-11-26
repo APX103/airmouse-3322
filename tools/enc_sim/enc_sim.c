@@ -26,7 +26,7 @@
 typedef int osal_task;
 typedef int osal_semaphore;
 typedef int pin_t;
-enum { S_MGPIO12 = 44, S_MGPIO13 = 45, S_MGPIO14 = 46 };
+enum { S_AGPIO7 = 82, S_AGPIO8 = 83, S_AGPIO13 = 88, S_AGPIO14 = 89 }; /* 真值来自 product_pin.h */ 
 typedef enum { GPIO_LEVEL_LOW = 0, GPIO_LEVEL_HIGH = 1 } gpio_level_t;
 static int g_pin_level[128]; /* simulated pin levels, 1 = high */
 static int g_active_high = 0; /* 0: contacts close to GND (open = high) ; 1: contacts close to 3.3V (open = low) */
